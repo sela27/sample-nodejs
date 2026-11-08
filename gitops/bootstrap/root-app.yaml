@@ -1,0 +1,25 @@
+# Root Application (app-of-apps), applied once by scripts/bootstrap.sh.
+# It syncs every child Application declared in gitops/apps on main, so adding a
+# component to the cluster means adding a file there, not running a command.
+#
+# It lives outside gitops/apps on purpose: it is not managed by itself.
+# Bootstrap can point it at another repo or revision (GIT_REPO_URL, GIT_REVISION)
+# to test a branch before it merges; the committed default is main.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sela27/sample-nodejs.git
+    targetRevision: main
+    path: gitops/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

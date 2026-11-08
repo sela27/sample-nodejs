@@ -1,0 +1,13 @@
+# Helm values for ArgoCD, installed by scripts/bootstrap.sh (chart argo/argo-cd).
+# ArgoCD is the only component installed from outside git; everything else is
+# declared under gitops/apps and synced by ArgoCD itself.
+#
+# Sized for a single-node local cluster: components the setup does not use are off.
+
+dex:
+  # No SSO for a local cluster; the built-in admin user is enough.
+  enabled: false
+
+notifications:
+  # ArgoCD Notifications are out of scope.
+  enabled: false

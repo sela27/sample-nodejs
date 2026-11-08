@@ -1,0 +1,43 @@
+# Traefik ingress controller, installed by ArgoCD from the official Helm chart.
+# It replaces minikube's retired ingress-nginx addon (ADR-0002).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traefik
+  namespace: argocd
+  # Deleting this Application (or removing this file from git) also deletes
+  # the Traefik resources it created.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://traefik.github.io/charts
+    chart: traefik
+    # Chart 42.3.1 ships Traefik v3.7.17.
+    targetRevision: 42.3.1
+    helm:
+      releaseName: traefik
+      valuesObject:
+        service:
+          spec:
+            # `minikube tunnel` gives this Service an address on localhost.
+            type: LoadBalancer
+        ingressClass:
+          enabled: true
+          name: traefik
+          # Our Ingress names its class explicitly; Ingresses without a class
+          # are not picked up silently.
+          isDefaultClass: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: traefik
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # The chart ships CRDs of over 100 KB; server-side apply keeps them out
+      # of the size-limited last-applied-configuration annotation.
+      - ServerSideApply=true
