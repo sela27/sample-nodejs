@@ -21,6 +21,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # The cluster must run what the repo pins, so expected versions are read from the
 # files that pin them rather than repeated here.
+# shellcheck disable=SC2016 # the sed pattern matches a literal ${...} in bootstrap.sh
 ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-$(sed -n 's/^ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-\(.*\)}"$/\1/p' "$REPO_ROOT/scripts/bootstrap.sh")}"
 TRAEFIK_CHART_VERSION="$(sed -n 's/^[[:space:]]*targetRevision:[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$REPO_ROOT/gitops/apps/traefik.yaml" 2>/dev/null || true)"
 
@@ -29,10 +30,22 @@ TRAEFIK_NOT_FOUND_BODY="404 page not found"
 
 tmp_dir="$(mktemp -d)"
 port_forward_pid=""
+
+# Stops a background process. In Git Bash, `kill` reaches only the MSYS stub of a
+# native Windows program (and package-manager shims start the real kubectl as a
+# child), so the whole Windows process tree is ended with taskkill.
+stop_background() {
+  local pid="$1"
+  if [[ -r "/proc/${pid}/winpid" ]] && command -v taskkill >/dev/null 2>&1; then
+    taskkill //F //T //PID "$(cat "/proc/${pid}/winpid")" >/dev/null 2>&1 || true
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   if [[ -n "$port_forward_pid" ]]; then
-    kill "$port_forward_pid" 2>/dev/null || true
-    wait "$port_forward_pid" 2>/dev/null || true
+    stop_background "$port_forward_pid"
   fi
   rm -rf "$tmp_dir"
 }
@@ -120,15 +133,20 @@ traefik_app_synced() {
   [[ "$(app_field traefik '{.status.sync.status}')" == "Synced" ]]
 }
 
-# Healthy needs a LoadBalancer address, which only `minikube tunnel` provides.
-# Without the tunnel, Progressing is expected as long as the only resource that
-# is not Healthy is the LoadBalancer Service.
+lb_address() { field -n traefik service traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; }
+
+# ArgoCD rates a LoadBalancer Service Progressing until it has an address, which
+# only `minikube tunnel` provides. Without the tunnel, Progressing is expected,
+# provided the Service really has no address and Traefik itself is available.
 traefik_app_healthy_or_waiting_for_tunnel() {
-  local health not_healthy
-  health="$(app_field traefik '{.status.health.status}')"
-  [[ "$health" == "Healthy" ]] && return 0
-  not_healthy="$(app_field traefik '{range .status.resources[?(@.health.status!="Healthy")]}{.kind}/{.name}={.health.status}{"\n"}{end}')"
-  [[ "$health" == "Progressing" && "$(grep -c . <<<"$not_healthy")" == 1 && "$not_healthy" == "Service/traefik=Progressing" ]]
+  case "$(app_field traefik '{.status.health.status}')" in
+    Healthy) return 0 ;;
+    Progressing)
+      [[ -z "$(lb_address)" &&
+        "$(field -n traefik deployment traefik -o jsonpath='{.status.availableReplicas}')" =~ ^[1-9] ]]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 traefik_runs_pinned_chart() {
@@ -166,8 +184,7 @@ traefik_404_through_port_forward() {
   done
   [[ -n "$port" ]] || return 1
   status="$(request "http://127.0.0.1:${port}/" "$body" --header "Host: ${APP_HOST}")"
-  kill "$port_forward_pid" 2>/dev/null || true
-  wait "$port_forward_pid" 2>/dev/null || true
+  stop_background "$port_forward_pid"
   port_forward_pid=""
   answers_traefik_404 "$status" "$body"
 }
@@ -194,10 +211,10 @@ check "Traefik runs chart ${TRAEFIK_CHART_VERSION:-<unknown>} with available rep
 check "Traefik Service is of type LoadBalancer" traefik_service_is_load_balancer
 check "Traefik answers its own 404 for Host ${APP_HOST} (port-forward)" traefik_404_through_port_forward
 
-if [[ -n "$(field -n traefik service traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" ]]; then
+if [[ -n "$(lb_address)" ]]; then
   check "http://${APP_HOST}/ answers Traefik's 404 through the tunnel, and traefik is Healthy" traefik_404_through_tunnel
 else
-  printf 'SKIP  http://%s/ through the tunnel (start `minikube tunnel -p %s` in another terminal, then re-run)\n' "$APP_HOST" "$MINIKUBE_PROFILE"
+  printf 'SKIP  http://%s/ through the tunnel (run "minikube tunnel -p %s" in another terminal, then re-run)\n' "$APP_HOST" "$MINIKUBE_PROFILE"
 fi
 
 if ((failures > 0)); then
