@@ -1,0 +1,33 @@
+# Chart defaults: everything that is the same in every Environment.
+# Each Environment's values file (values-<environment>.yaml) adds the image and
+# the Ingress host.
+
+replicaCount: 1
+
+image:
+  # Set by each Environment's values file.
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Requests are what the scheduler reserves per pod; limits cap a single pod so
+# it cannot starve the node. The app idles at about 40 MiB.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+ingress:
+  className: traefik
+  # Set by each Environment's values file.
+  host: ""
+  # The Public paths: the only app paths reachable from outside the cluster.
+  # Each is a Prefix match, so /my-app also covers /my-app/..., but not
+  # /my-appx. Every other path, such as /classified, /metrics, /ready and
+  # /live, has no route and stays internal.
+  publicPaths:
+    - /my-app
+    - /about

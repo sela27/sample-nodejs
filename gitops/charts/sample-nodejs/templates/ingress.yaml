@@ -1,0 +1,23 @@
+{{- $fullname := include "sample-nodejs.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "sample-nodejs.labels" . | nindent 4 }}
+spec:
+  # Only the class, no controller-specific annotations (ADR-0002).
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ required "ingress.host must be set in the Environment's values file" .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range .Values.ingress.publicPaths }}
+          - path: {{ . | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: http
+          {{- end }}
