@@ -19,6 +19,7 @@ ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json app.js ./
+RUN apk add --no-cache curl
 USER node
 EXPOSE 8080
 CMD ["node", "app.js"]
