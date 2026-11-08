@@ -64,3 +64,30 @@ Every Alpine finding was in the npm that the image bundles (its copies of `undic
 A scan of the built image with the same Trivy version finds nothing in Alpine or in Node's tooling. Any findings left are in the app's own locked dependencies, not in the base image.
 
 The image is about 65 MB compressed. The `node` binary is most of that, and the app's dependencies add about 10 MB.
+
+## Pipeline
+
+Every pull request to `main` runs these checks, defined in `.github/workflows/pr.yml`:
+
+| Check | What it runs | Fails when |
+| --- | --- | --- |
+| `test` | `npm ci --ignore-scripts`, then `npm test`, on Node 24 | any test fails |
+| `dockerfile-lint` | hadolint 2.15.1 on `Dockerfile` | any finding of severity warning or error (info and style findings are printed but pass) |
+
+Each check is its own job, so a failure shows as its own red check on the PR. The check names are a contract with the branch protection on `main`, which requires them by name. No job sets `name:`, so GitHub names each check after its job id. The PR page shows `PR / test (pull_request)`, but the name the ruleset matches is the bare job id, `test`. A job id therefore never changes unless the ruleset changes in the same PR. New Gates are added as new jobs at the end of the workflow and as new rows in this table.
+
+To run the same checks locally:
+
+```bash
+npm ci && npm test
+docker run --rm -i ghcr.io/hadolint/hadolint:v2.15.1 hadolint --failure-threshold warning - < Dockerfile
+```
+
+### Supply chain and permissions
+
+- Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
+- The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
+- The workflow's default token permission is `contents: read` and nothing else. A job that needs more, such as pushing an image or creating a Release, asks for it in its own `permissions:` block.
+- `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps.
+- `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
+- A new push to a PR cancels that PR's run still in progress.
