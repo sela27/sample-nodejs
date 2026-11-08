@@ -1,0 +1,9 @@
+# Allowlist: the build context holds only what the image build needs.
+# Everything else stays out by default: git metadata, tests, docs, the
+# tracker directory, the chart, CI and AI tooling, local node_modules and
+# any stray secrets such as .env. A new source file must be listed here
+# and copied in the Dockerfile.
+*
+!app.js
+!package.json
+!package-lock.json
