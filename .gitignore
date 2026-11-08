@@ -1,1 +1,11 @@
 node_modules/
+
+# Local AI tooling (kept on disk, not part of the deliverable)
+.agents/
+.claude/
+CLAUDE.md
+skills-lock.json
+docs/agents/
+
+# Assignment text (kept locally, not published)
+DevOps-Task-K8S.md
