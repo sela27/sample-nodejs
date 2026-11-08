@@ -1,0 +1,54 @@
+# PR pipeline: the checks every pull request to main must pass.
+#
+# Each job id below is a required status check on main. GitHub names the
+# check after the job id because no job sets `name:`, so renaming a job id
+# breaks merging until the ruleset is updated. New Gates are appended as
+# further jobs at the end of this file.
+#
+# Third-party actions are pinned by full commit SHA, with the version in a
+# trailing comment, so a moved or hijacked tag cannot change what runs here.
+name: PR
+
+on:
+  pull_request:
+    branches: [main]
+
+# Read-only by default. A job that needs more asks for it in its own
+# `permissions:` block.
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Unit tests: drive the app through its HTTP interface (test/).
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+
+  # Dockerfile lint with hadolint. Warnings and errors fail the check;
+  # info and style findings are reported but do not fail it.
+  dockerfile-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
