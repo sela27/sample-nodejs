@@ -45,6 +45,11 @@ app.get('/metrics', async (req, res) => {
     res.end(await register.metrics());
 });
 
-app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-});
+// Listen only when run as the entrypoint (`node app.js`), so tests can load the app without opening a port.
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+    });
+}
+
+module.exports = app;
