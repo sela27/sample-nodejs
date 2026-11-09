@@ -77,13 +77,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned helm, kubeconform and yq
+        # get.helm.sh sometimes answers 504; retry instead of failing the check.
         run: |
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
           cd "$RUNNER_TEMP"
-          curl -fsSLo helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-          curl -fsSLo kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
-          curl -fsSLo yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
           sha256sum -c - <<EOF
           ${HELM_SHA256}  helm.tar.gz
           ${KUBECONFORM_SHA256}  kubeconform.tar.gz
