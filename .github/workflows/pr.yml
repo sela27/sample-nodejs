@@ -1,9 +1,10 @@
 # PR pipeline: the checks every pull request to main must pass.
 #
-# Each job id below is a required status check on main. GitHub names the
-# check after the job id because no job sets `name:`, so renaming a job id
-# breaks merging until the ruleset is updated. New Gates are appended as
-# further jobs at the end of this file.
+# Each job id below is a required status check on main, listed in
+# REQUIRED_CHECKS in scripts/protect-main.sh. GitHub names the check after the
+# job id because no job sets `name:`, so renaming a job id breaks merging until
+# the ruleset is updated. New Gates are appended as further jobs at the end of
+# this file and to that list.
 #
 # Third-party actions are pinned by full commit SHA, with the version in a
 # trailing comment, so a moved or hijacked tag cannot change what runs here.
