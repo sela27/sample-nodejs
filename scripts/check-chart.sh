@@ -72,6 +72,9 @@ SERVICE_PORT="80"
 DEV_HOST="sample-nodejs.127.0.0.1.nip.io"
 # The Public paths (GLOSSARY.md), sorted. Every other app path stays internal.
 PUBLIC_PATHS="/about /my-app"
+# The user and group the image runs as (the Dockerfile's USER).
+APP_UID="1000"
+APP_GID="1000"
 
 # Evaluates a yq expression over all rendered documents at once.
 q() { yq ea "$1" "$rendered" | tr -d '\r'; }
@@ -125,6 +128,20 @@ for resource in requests.cpu requests.memory limits.cpu limits.memory; do
   value="$(q "$container | .resources.$resource")"
   expect "resources.$resource is set" "set" "$([[ -n "$value" && "$value" != "null" ]] && echo set || echo unset)"
 done
+
+# The restricted Pod Security profile, plus a read-only root filesystem.
+# A setting can sit on the pod or on the container; the container's own value
+# wins, as in the kubelet, so moving a setting between the two keeps it passing.
+effective() {
+  q "$deployment | .spec.template.spec as \$pod
+    | (\$pod | .containers[0].securityContext.$1) as \$own
+    | if \$own == null then (\$pod | .securityContext.$1) else \$own end"
+}
+
+expect "runAsNonRoot" "true" "$(effective runAsNonRoot)"
+expect "runAsUser is the image's uid" "$APP_UID" "$(effective runAsUser)"
+expect "runAsGroup is the image's gid" "$APP_GID" "$(effective runAsGroup)"
+expect "seccomp profile" "RuntimeDefault" "$(effective seccompProfile.type)"
 
 service='select(.kind == "Service")'
 
