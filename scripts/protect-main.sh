@@ -26,6 +26,7 @@ REQUIRED_CHECKS=(
   test
   dockerfile-lint
   chart
+  secrets
   image-gate
 )
 

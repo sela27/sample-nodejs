@@ -2,7 +2,8 @@
 # Chart Gate: lints the Helm chart, renders it with the dev values, validates
 # the rendered manifests against the Kubernetes schemas, and checks what the
 # rendered manifests promise: only the Public paths behind the Ingress, probes
-# on the app's health endpoints, the ports, and the standard labels.
+# on the app's health endpoints, the ports, the pod hardening, the
+# ServiceAccount, and the standard labels.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits
@@ -72,6 +73,12 @@ SERVICE_PORT="80"
 DEV_HOST="sample-nodejs.127.0.0.1.nip.io"
 # The Public paths (GLOSSARY.md), sorted. Every other app path stays internal.
 PUBLIC_PATHS="/about /my-app"
+# The user and group the image runs as (the Dockerfile's USER).
+APP_UID="1000"
+APP_GID="1000"
+# The registry pull secret Bootstrap creates in the app namespace (ADR-0003).
+# Bootstrap and the chart must agree on this name.
+PULL_SECRET="ghcr-pull"
 
 # Evaluates a yq expression over all rendered documents at once.
 q() { yq ea "$1" "$rendered" | tr -d '\r'; }
@@ -125,6 +132,40 @@ for resource in requests.cpu requests.memory limits.cpu limits.memory; do
   value="$(q "$container | .resources.$resource")"
   expect "resources.$resource is set" "set" "$([[ -n "$value" && "$value" != "null" ]] && echo set || echo unset)"
 done
+
+# The restricted Pod Security profile, plus a read-only root filesystem.
+# A setting can sit on the pod or on the container; the container's own value
+# wins, as in the kubelet, so moving a setting between the two keeps it passing.
+effective() {
+  q "$deployment | .spec.template.spec as \$pod
+    | (\$pod | .containers[0].securityContext.$1) as \$own
+    | if \$own == null then (\$pod | .securityContext.$1) else \$own end"
+}
+
+expect "runAsNonRoot" "true" "$(effective runAsNonRoot)"
+expect "runAsUser is the image's uid" "$APP_UID" "$(effective runAsUser)"
+expect "runAsGroup is the image's gid" "$APP_GID" "$(effective runAsGroup)"
+expect "seccomp profile" "RuntimeDefault" "$(effective seccompProfile.type)"
+# Container-only settings.
+expect "readOnlyRootFilesystem" "true" "$(q "$container | .securityContext.readOnlyRootFilesystem")"
+expect "allowPrivilegeEscalation" "false" "$(q "$container | .securityContext.allowPrivilegeEscalation")"
+expect "capabilities dropped" "ALL" "$(q "[$container | .securityContext.capabilities.drop[]] | join(\" \")")"
+expect "capabilities added" "none" \
+  "$(q "[$container | .securityContext.capabilities.add[]] | join(\" \")" | sed 's/^$/none/')"
+
+# A dedicated ServiceAccount with no Kubernetes API token, which hands the pods
+# the registry pull secret.
+serviceaccount='select(.kind == "ServiceAccount")'
+
+expect "one ServiceAccount" "1" "$(q "[$serviceaccount] | length")"
+expect "pods run under the ServiceAccount" "$(q "$serviceaccount | .metadata.name")" \
+  "$(q "$deployment | .spec.template.spec.serviceAccountName")"
+expect "ServiceAccount does not automount its token" "false" "$(q "$serviceaccount | .automountServiceAccountToken")"
+# The pod's own setting wins over the ServiceAccount's.
+pod_token="$(q "$deployment | .spec.template.spec.automountServiceAccountToken")"
+[[ "$pod_token" == "null" ]] && pod_token="$(q "$serviceaccount | .automountServiceAccountToken")"
+expect "pods mount no API token" "false" "$pod_token"
+expect "ServiceAccount pull secret" "$PULL_SECRET" "$(q "[$serviceaccount | .imagePullSecrets[].name] | join(\" \")")"
 
 service='select(.kind == "Service")'
 

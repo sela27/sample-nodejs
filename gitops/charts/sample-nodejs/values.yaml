@@ -9,6 +9,10 @@ image:
   repository: ""
   tag: ""
   pullPolicy: IfNotPresent
+  # The registry pull secret for the private image. Bootstrap creates it in
+  # the app namespace (ADR-0003); the chart only refers to it by name, through
+  # the ServiceAccount.
+  pullSecret: ghcr-pull
 
 # Requests are what the scheduler reserves per pod; limits cap a single pod so
 # it cannot starve the node. The app idles at about 40 MiB.

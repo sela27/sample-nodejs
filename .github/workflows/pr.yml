@@ -56,7 +56,8 @@ jobs:
 
   # Helm chart: helm lint, then the chart rendered with the dev values is
   # validated against the Kubernetes schemas (kubeconform, strict) and checked
-  # for what it must promise (Public paths only, probes, ports, labels).
+  # for what it must promise (Public paths only, probes, ports, pod hardening,
+  # ServiceAccount, labels).
   # scripts/check-chart.sh holds the checks, so a local run matches this job.
   chart:
     runs-on: ubuntu-24.04
@@ -76,13 +77,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned helm, kubeconform and yq
+        # get.helm.sh sometimes answers 504; retry instead of failing the check.
         run: |
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
           cd "$RUNNER_TEMP"
-          curl -fsSLo helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-          curl -fsSLo kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
-          curl -fsSLo yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
           sha256sum -c - <<EOF
           ${HELM_SHA256}  helm.tar.gz
           ${KUBECONFORM_SHA256}  kubeconform.tar.gz
@@ -96,6 +98,41 @@ jobs:
           "$bin/kubeconform" -v
           "$bin/yq" --version
       - run: scripts/check-chart.sh
+
+  # Secret scan with gitleaks and its default rules, over every commit this PR
+  # brings: those reachable from the PR head but not from the base branch. A
+  # secret added in one commit and removed in a later one is still caught,
+  # because it stays in the PR's history on GitHub. Any finding fails the
+  # check. Findings are printed redacted, so the public job log does not repeat
+  # the leaked value.
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      # Pinned by version and by the SHA-256 of its linux-x64 release file, like
+      # the tools in the chart job.
+      GITLEAKS_VERSION: v8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history, so both ends of the PR's commit range are present.
+          fetch-depth: 0
+      - name: Install pinned gitleaks
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz -C "$bin" gitleaks
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/gitleaks" version
+      - name: Scan the commits this PR brings
+        run: gitleaks git --no-banner --redact --verbose --log-opts="${BASE_SHA}..${HEAD_SHA}" .
 
   # Image Gate: the image is built with BuildKit and loaded into the runner's
   # Docker engine. It is never pushed, and no step logs in to a registry.
