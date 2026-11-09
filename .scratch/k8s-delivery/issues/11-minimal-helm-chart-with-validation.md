@@ -13,7 +13,7 @@
 - [x] Service: ClusterIP, port 80 to 8080.
 - [x] Ingress: `ingressClassName: traefik`, no controller-specific annotations, Prefix paths for `/my-app` and `/about` only, and the host from values.
 - [x] Standard `app.kubernetes.io/*` labels.
-- [ ] Job `chart` runs `helm lint`, then renders with the `dev` values and runs kubeconform in strict mode against a pinned Kubernetes version. `chart` is added to the required checks.
-  - The job is done. The required-checks list belongs to ticket 05's protection script, which is not on `main` yet, so `chart` still has to be appended to it.
+- [x] Job `chart` runs `helm lint`, then renders with the `dev` values and runs kubeconform in strict mode against a pinned Kubernetes version. `chart` is added to the required checks.
+  - `chart` was added to the required checks by ticket 05: it is in `REQUIRED_CHECKS` in `scripts/protect-main.sh`, and that script applied it to the `protect-main` ruleset.
 - [x] The README gains a "Helm chart" section, including the Deployment-vs-StatefulSet justification.
 - [x] PR title is `chore(chart): …`. Chart changes reach the cluster through ArgoCD and never produce a Release. Status set to `done` in the same PR.
