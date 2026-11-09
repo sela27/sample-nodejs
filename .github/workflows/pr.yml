@@ -96,3 +96,56 @@ jobs:
           "$bin/kubeconform" -v
           "$bin/yq" --version
       - run: scripts/check-chart.sh
+
+  # Image Gate: the image is built with BuildKit and loaded into the runner's
+  # Docker engine. It is never pushed, and no step logs in to a registry.
+  # Trivy then scans it and fails the check on any HIGH or CRITICAL
+  # vulnerability, in Alpine or in the app's dependencies, including findings
+  # with no fixed version yet. Accepted exceptions live in .trivyignore, each
+  # with its justification.
+  image-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Trivy is pinned by version and by the SHA-256 of its Linux-64bit
+      # release file, the same way as the tools in the chart job, instead of
+      # through aquasecurity/trivy-action or setup-trivy, whose tags were
+      # hijacked on 2026-03-19 (CVE-2026-33634). 0.76.2 is an immutable
+      # GitHub release, outside the compromised 0.69.4-0.69.6, and past every
+      # published Trivy advisory.
+      TRIVY_VERSION: 0.76.2
+      TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+      IMAGE: sample-nodejs:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Trivy
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/trivy" --version
+      - name: Build the image with BuildKit, loaded locally and not pushed
+        run: |
+          docker buildx version
+          docker buildx build --load --tag "$IMAGE" .
+      # --image-src docker scans the image just built in the local engine and
+      # never pulls one from a registry. --ignore-unfixed is not set, so a
+      # finding without a fixed version still fails the check.
+      - name: Scan the image for HIGH and CRITICAL vulnerabilities
+        run: |
+          trivy image \
+            --image-src docker \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignorefile .trivyignore \
+            --format table \
+            --exit-code 1 \
+            --no-progress \
+            "$IMAGE"
