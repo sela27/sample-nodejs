@@ -142,6 +142,12 @@ expect "runAsNonRoot" "true" "$(effective runAsNonRoot)"
 expect "runAsUser is the image's uid" "$APP_UID" "$(effective runAsUser)"
 expect "runAsGroup is the image's gid" "$APP_GID" "$(effective runAsGroup)"
 expect "seccomp profile" "RuntimeDefault" "$(effective seccompProfile.type)"
+# Container-only settings.
+expect "readOnlyRootFilesystem" "true" "$(q "$container | .securityContext.readOnlyRootFilesystem")"
+expect "allowPrivilegeEscalation" "false" "$(q "$container | .securityContext.allowPrivilegeEscalation")"
+expect "capabilities dropped" "ALL" "$(q "[$container | .securityContext.capabilities.drop[]] | join(\" \")")"
+expect "capabilities added" "none" \
+  "$(q "[$container | .securityContext.capabilities.add[]] | join(\" \")" | sed 's/^$/none/')"
 
 service='select(.kind == "Service")'
 

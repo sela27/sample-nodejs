@@ -27,6 +27,13 @@ spec:
         - name: app
           image: {{ include "sample-nodejs.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            # The app writes nothing to disk, so it needs no writable path.
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             # The app's default PORT. The probes and the Service refer to it by name.
             - name: http
