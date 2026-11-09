@@ -78,13 +78,19 @@ jobs:
           persist-credentials: false
       - name: Install pinned helm, kubeconform and yq
         # get.helm.sh sometimes answers 504; retry instead of failing the check.
+        # GitHub release assets come through the API with the read-only job
+        # token, so throttling of anonymous downloads cannot fail the check.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
           cd "$RUNNER_TEMP"
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          gh release download "${KUBECONFORM_VERSION}" --repo yannh/kubeconform \
+            --pattern kubeconform-linux-amd64.tar.gz --output kubeconform.tar.gz
+          gh release download "${YQ_VERSION}" --repo mikefarah/yq \
+            --pattern yq_linux_amd64 --output yq
           sha256sum -c - <<EOF
           ${HELM_SHA256}  helm.tar.gz
           ${KUBECONFORM_SHA256}  kubeconform.tar.gz
@@ -122,11 +128,16 @@ jobs:
           # Full history, so both ends of the PR's commit range are present.
           fetch-depth: 0
       - name: Install pinned gitleaks
+        # Through the API with the read-only job token, so throttling of
+        # anonymous downloads cannot fail the check.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
           cd "$RUNNER_TEMP"
-          curl -fsSLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz"
+          gh release download "${GITLEAKS_VERSION}" --repo gitleaks/gitleaks \
+            --pattern "gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" --output gitleaks.tar.gz
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar -xzf gitleaks.tar.gz -C "$bin" gitleaks
           echo "$bin" >> "$GITHUB_PATH"
