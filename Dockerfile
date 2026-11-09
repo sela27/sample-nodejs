@@ -19,6 +19,8 @@ ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json app.js ./
-USER node
+# The base image's node user and group, by number: a runtime can check a
+# numeric uid against runAsNonRoot without reading the image's /etc/passwd.
+USER 1000:1000
 EXPOSE 8080
 CMD ["node", "app.js"]
