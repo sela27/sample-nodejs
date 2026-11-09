@@ -31,6 +31,14 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end }}
 
 {{/*
+The app's configuration, as environment variables: the ConfigMap's data.
+*/}}
+{{- define "sample-nodejs.config" -}}
+PORT: {{ .Values.config.port | quote }}
+NODE_ENV: {{ .Values.config.nodeEnv | quote }}
+{{- end }}
+
+{{/*
 The image reference. Both parts come from the Environment's values file.
 */}}
 {{- define "sample-nodejs.image" -}}

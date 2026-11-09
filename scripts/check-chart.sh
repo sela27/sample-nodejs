@@ -3,7 +3,8 @@
 # the rendered manifests against the Kubernetes schemas, and checks what the
 # rendered manifests promise: only the Public paths behind the Ingress, probes
 # on the app's health endpoints, the ports, the pod hardening, the
-# ServiceAccount, and the standard labels.
+# ServiceAccount, the app configuration and its rollout checksum, and the
+# standard labels.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits
@@ -80,8 +81,29 @@ APP_GID="1000"
 # Bootstrap and the chart must agree on this name.
 PULL_SECRET="ghcr-pull"
 
-# Evaluates a yq expression over all rendered documents at once.
-q() { yq ea "$1" "$rendered" | tr -d '\r'; }
+# The app's configuration (spec, Helm chart). The image also sets NODE_ENV to
+# production, so the checks below tell the two apart by where the value comes
+# from.
+NODE_ENV_VALUE="production"
+# The pod template annotation that carries a checksum of the ConfigMap.
+CHECKSUM_ANNOTATION="checksum/config"
+
+# Evaluates a yq expression over all documents of a rendered file at once.
+qf() { yq ea "$2" "$1" | tr -d '\r'; }
+# The same, over the render with the dev values.
+q() { qf "$rendered" "$1"; }
+
+# Renders the chart with the dev values plus extra helm flags into
+# $tmp_dir/<name>.yaml, for checks of what a values change does.
+render_with() {
+  local name="$1"
+  shift
+  if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" "$@" >"$tmp_dir/$name.yaml"; then
+    return 0
+  fi
+  fail "render with the dev values and $*"
+  return 1
+}
 
 expect() {
   local name="$1" want="$2" got="$3"
@@ -93,15 +115,71 @@ expect() {
 }
 
 # Resolves a port reference (number or container port name) to the number the
-# app container listens on.
+# app container listens on, in the dev render or in the rendered file $2.
 container_port_number() {
-  local ref="$1"
+  local ref="$1" file="${2:-$rendered}"
   if [[ "$ref" =~ ^[0-9]+$ ]]; then
     printf '%s' "$ref"
   else
-    q "select(.kind == \"Deployment\") | .spec.template.spec.containers[0].ports[] | select(.name == \"$ref\") | .containerPort"
+    qf "$file" "select(.kind == \"Deployment\") | .spec.template.spec.containers[0].ports[] | select(.name == \"$ref\") | .containerPort"
   fi
 }
+
+# Prints the value of key $3 in the ConfigMap named $2 that the rendered file
+# $1 contains. Fails if the file has no such ConfigMap or key.
+configmap_value() {
+  local file="$1" name="$2" key="$3"
+  local cm="select(.kind == \"ConfigMap\" and .metadata.name == \"$name\")"
+  [[ "$(qf "$file" "[$cm | .data // {} | select(has(\"$key\"))] | length")" == "1" ]] || return 1
+  qf "$file" "$cm | .data[\"$key\"]"
+}
+
+# Prints the value the app container in the rendered file $1 sees for the
+# environment variable $2, and where it comes from: "<value> from ConfigMap",
+# "<value> from env", or "image ENV" when the chart does not set it. Resolved
+# the way the kubelet does it: an `env` entry wins over `envFrom`, a later
+# `envFrom` source wins over an earlier one, and both win over the image's own
+# ENV. A ConfigMap counts only if the chart renders it, so a reference to a
+# missing ConfigMap reads as not set.
+effective_env() {
+  local file="$1" var="$2" result="image ENV" count i prefix source value
+  local app="select(.kind == \"Deployment\") | .spec.template.spec.containers[0]"
+  count="$(qf "$file" "$app | .envFrom // [] | length")"
+  for ((i = 0; i < count; i++)); do
+    prefix="$(qf "$file" "$app | .envFrom[$i].prefix // \"\"")"
+    [[ "$var" == "$prefix"* ]] || continue
+    source="$(qf "$file" "$app | .envFrom[$i].configMapRef.name // \"\"")"
+    if [[ -z "$source" ]]; then
+      result="unknown (envFrom a source other than a ConfigMap)"
+    elif value="$(configmap_value "$file" "$source" "${var#"$prefix"}")"; then
+      result="$value from ConfigMap"
+    fi
+  done
+  local entry="[$app | .env // [] | .[] | select(.name == \"$var\")]"
+  if [[ "$(qf "$file" "$entry | length")" != "0" ]]; then
+    # The last entry, as the kubelet sets them in order.
+    entry="$entry | .[-1]"
+    source="$(qf "$file" "$entry | .valueFrom.configMapKeyRef.name // \"\"")"
+    if [[ -n "$source" ]]; then
+      if value="$(configmap_value "$file" "$source" "$(qf "$file" "$entry | .valueFrom.configMapKeyRef.key")")"; then
+        result="$value from ConfigMap"
+      else
+        result="unset (env refers to a key the ConfigMap lacks)"
+      fi
+    else
+      result="$(qf "$file" "$entry | .value // \"(valueFrom)\"") from env"
+    fi
+  fi
+  printf '%s' "$result"
+}
+
+# The checksum annotation on the pod template of the rendered file $1.
+checksum_of() {
+  qf "$1" "select(.kind == \"Deployment\") | .spec.template.metadata.annotations[\"$CHECKSUM_ANNOTATION\"] // \"\""
+}
+
+# Prints "changed" if the two checksums differ, else "unchanged".
+differs() { [[ "$1" != "$2" ]] && echo changed || echo unchanged; }
 
 # Resolves a port reference (number or Service port name) to a Service port number.
 service_port_number() {
@@ -181,6 +259,52 @@ pod_labels="$(q "$deployment | .spec.template.metadata.labels | to_entries | .[]
 unmatched="$(comm -23 <(printf '%s\n' "$selector") <(printf '%s\n' "$pod_labels"))"
 expect "Service selects the app pods" "selects" \
   "$([[ -n "$selector" && -z "$unmatched" ]] && echo selects || echo "selector '${selector//$'\n'/,}' not on pods")"
+
+# The app's configuration: PORT and NODE_ENV reach the app from a ConfigMap,
+# and a checksum of the ConfigMap on the pod template rolls the pods when the
+# configuration changes.
+configmap='select(.kind == "ConfigMap")'
+
+expect "one ConfigMap" "1" "$(q "[$configmap] | length")"
+expect "PORT reaches the app from the ConfigMap" "$CONTAINER_PORT from ConfigMap" "$(effective_env "$rendered" PORT)"
+expect "NODE_ENV reaches the app from the ConfigMap" "$NODE_ENV_VALUE from ConfigMap" "$(effective_env "$rendered" NODE_ENV)"
+dev_checksum="$(checksum_of "$rendered")"
+expect "pod template carries the $CHECKSUM_ANNOTATION annotation" "present" \
+  "$([[ -n "$dev_checksum" ]] && echo present || echo missing)"
+
+# Another NODE_ENV in the values reaches the app, over the image's own
+# NODE_ENV, and changes the checksum.
+if render_with node-env --set config.nodeEnv=development; then
+  variant="$tmp_dir/node-env.yaml"
+  expect "NODE_ENV from the values overrides the image's" "development from ConfigMap" \
+    "$(effective_env "$variant" NODE_ENV)"
+  expect "changing NODE_ENV changes the checksum" "changed" "$(differs "$dev_checksum" "$(checksum_of "$variant")")"
+fi
+
+# One value sets the port: another port moves PORT, the container port, the
+# probes and the Service's target together, and changes the checksum.
+OTHER_PORT="9090"
+if render_with port --set config.port="$OTHER_PORT"; then
+  variant="$tmp_dir/port.yaml"
+  expect "port $OTHER_PORT: PORT" "$OTHER_PORT from ConfigMap" "$(effective_env "$variant" PORT)"
+  expect "port $OTHER_PORT: container ports" "$OTHER_PORT" \
+    "$(qf "$variant" "[$container | .ports[].containerPort] | join(\" \")")"
+  for kind in startupProbe livenessProbe readinessProbe; do
+    expect "port $OTHER_PORT: $kind port" "$OTHER_PORT" \
+      "$(container_port_number "$(qf "$variant" "$container | .$kind.httpGet.port")" "$variant")"
+  done
+  expect "port $OTHER_PORT: Service port $SERVICE_PORT reaches it" "$OTHER_PORT" \
+    "$(container_port_number "$(qf "$variant" "$service | .spec.ports[] | select(.port == $SERVICE_PORT) | .targetPort")" "$variant")"
+  expect "changing the port changes the checksum" "changed" "$(differs "$dev_checksum" "$(checksum_of "$variant")")"
+fi
+
+# A values change outside the ConfigMap keeps the checksum, so it causes no
+# rollout of its own. This also catches a checksum that differs between two
+# renders of the same configuration, which ArgoCD would show as constant drift.
+if render_with replicas --set replicaCount=3; then
+  expect "a change outside the ConfigMap keeps the checksum" "$dev_checksum" \
+    "$(checksum_of "$tmp_dir/replicas.yaml")"
+fi
 
 ingress='select(.kind == "Ingress")'
 backends="$ingress | .spec.rules[].http.paths[].backend.service"
