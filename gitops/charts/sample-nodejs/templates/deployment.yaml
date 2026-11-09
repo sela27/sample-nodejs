@@ -14,6 +14,10 @@ spec:
       labels:
         {{- include "sample-nodejs.labels" . | nindent 8 }}
     spec:
+      serviceAccountName: {{ include "sample-nodejs.fullname" . }}
+      # Also set on the ServiceAccount; set here too, because the pod's own
+      # setting is the one that wins.
+      automountServiceAccountToken: false
       # The restricted Pod Security profile. These settings are written here,
       # not taken from values, so no Environment's values file can loosen them.
       securityContext:

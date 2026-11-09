@@ -75,6 +75,9 @@ PUBLIC_PATHS="/about /my-app"
 # The user and group the image runs as (the Dockerfile's USER).
 APP_UID="1000"
 APP_GID="1000"
+# The registry pull secret Bootstrap creates in the app namespace (ADR-0003).
+# Bootstrap and the chart must agree on this name.
+PULL_SECRET="ghcr-pull"
 
 # Evaluates a yq expression over all rendered documents at once.
 q() { yq ea "$1" "$rendered" | tr -d '\r'; }
@@ -148,6 +151,20 @@ expect "allowPrivilegeEscalation" "false" "$(q "$container | .securityContext.al
 expect "capabilities dropped" "ALL" "$(q "[$container | .securityContext.capabilities.drop[]] | join(\" \")")"
 expect "capabilities added" "none" \
   "$(q "[$container | .securityContext.capabilities.add[]] | join(\" \")" | sed 's/^$/none/')"
+
+# A dedicated ServiceAccount with no Kubernetes API token, which hands the pods
+# the registry pull secret.
+serviceaccount='select(.kind == "ServiceAccount")'
+
+expect "one ServiceAccount" "1" "$(q "[$serviceaccount] | length")"
+expect "pods run under the ServiceAccount" "$(q "$serviceaccount | .metadata.name")" \
+  "$(q "$deployment | .spec.template.spec.serviceAccountName")"
+expect "ServiceAccount does not automount its token" "false" "$(q "$serviceaccount | .automountServiceAccountToken")"
+# The pod's own setting wins over the ServiceAccount's.
+pod_token="$(q "$deployment | .spec.template.spec.automountServiceAccountToken")"
+[[ "$pod_token" == "null" ]] && pod_token="$(q "$serviceaccount | .automountServiceAccountToken")"
+expect "pods mount no API token" "false" "$pod_token"
+expect "ServiceAccount pull secret" "$PULL_SECRET" "$(q "[$serviceaccount | .imagePullSecrets[].name] | join(\" \")")"
 
 service='select(.kind == "Service")'
 
