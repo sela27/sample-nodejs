@@ -1,0 +1,8 @@
+apiVersion: v2
+name: sample-nodejs
+description: The sample-nodejs Express app behind a Traefik Ingress.
+type: application
+# ArgoCD renders the chart straight from git, so this version is never
+# published and drives nothing. The app version is the image tag that each
+# Environment's values file sets.
+version: 0.1.0

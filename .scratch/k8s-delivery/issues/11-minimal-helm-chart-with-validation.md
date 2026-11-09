@@ -6,13 +6,14 @@
 
 **Blocked by:** 04
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The chart lives in the GitOps directory (ADR-0001), with chart defaults and a separate `dev` values file. That file sets the image repository to `ghcr.io/sela27/sample-nodejs`, documents the tag placeholder, and sets the host to `sample-nodejs.127.0.0.1.nip.io`.
-- [ ] Deployment: startup and liveness probes on `/live`, readiness probe on `/ready`, container port 8080, and resources from values.
-- [ ] Service: ClusterIP, port 80 to 8080.
-- [ ] Ingress: `ingressClassName: traefik`, no controller-specific annotations, Prefix paths for `/my-app` and `/about` only, and the host from values.
-- [ ] Standard `app.kubernetes.io/*` labels.
+- [x] The chart lives in the GitOps directory (ADR-0001), with chart defaults and a separate `dev` values file. That file sets the image repository to `ghcr.io/sela27/sample-nodejs`, documents the tag placeholder, and sets the host to `sample-nodejs.127.0.0.1.nip.io`.
+- [x] Deployment: startup and liveness probes on `/live`, readiness probe on `/ready`, container port 8080, and resources from values.
+- [x] Service: ClusterIP, port 80 to 8080.
+- [x] Ingress: `ingressClassName: traefik`, no controller-specific annotations, Prefix paths for `/my-app` and `/about` only, and the host from values.
+- [x] Standard `app.kubernetes.io/*` labels.
 - [ ] Job `chart` runs `helm lint`, then renders with the `dev` values and runs kubeconform in strict mode against a pinned Kubernetes version. `chart` is added to the required checks.
-- [ ] The README gains a "Helm chart" section, including the Deployment-vs-StatefulSet justification.
-- [ ] PR title is `chore(chart): …`. Chart changes reach the cluster through ArgoCD and never produce a Release. Status set to `done` in the same PR.
+  - The job is done. The required-checks list belongs to ticket 05's protection script, which is not on `main` yet, so `chart` still has to be appended to it.
+- [x] The README gains a "Helm chart" section, including the Deployment-vs-StatefulSet justification.
+- [x] PR title is `chore(chart): …`. Chart changes reach the cluster through ArgoCD and never produce a Release. Status set to `done` in the same PR.
