@@ -120,13 +120,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # gh fetches the release file through the GitHub API with the job's
+      # read-only token. Anonymous downloads from github.com/.../releases
+      # returned 504 during GitHub's 2026-11-09 incident while the API kept
+      # serving the same file.
       - name: Install pinned Trivy
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
           cd "$RUNNER_TEMP"
-          curl -fsSL --retry 3 -o trivy.tar.gz \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          gh release download "v${TRIVY_VERSION}" --repo aquasecurity/trivy \
+            --pattern "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" --output trivy.tar.gz
           echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
           tar -xzf trivy.tar.gz -C "$bin" trivy
           echo "$bin" >> "$GITHUB_PATH"
