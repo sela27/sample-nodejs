@@ -2,7 +2,8 @@
 # Chart Gate: lints the Helm chart, renders it with the dev values, validates
 # the rendered manifests against the Kubernetes schemas, and checks what the
 # rendered manifests promise: only the Public paths behind the Ingress, probes
-# on the app's health endpoints, the ports, and the standard labels.
+# on the app's health endpoints, the ports, the pod hardening, the
+# ServiceAccount, and the standard labels.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits

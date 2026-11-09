@@ -55,7 +55,8 @@ jobs:
 
   # Helm chart: helm lint, then the chart rendered with the dev values is
   # validated against the Kubernetes schemas (kubeconform, strict) and checked
-  # for what it must promise (Public paths only, probes, ports, labels).
+  # for what it must promise (Public paths only, probes, ports, pod hardening,
+  # ServiceAccount, labels).
   # scripts/check-chart.sh holds the checks, so a local run matches this job.
   chart:
     runs-on: ubuntu-24.04
