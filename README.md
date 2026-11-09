@@ -164,6 +164,7 @@ Every pull request to `main` runs these checks, defined in `.github/workflows/pr
 | `test` | `npm ci --ignore-scripts`, then `npm test`, on Node 24 | any test fails |
 | `dockerfile-lint` | hadolint 2.15.1 on `Dockerfile` | any finding of severity warning or error (info and style findings are printed but pass) |
 | `chart` | `scripts/check-chart.sh`: helm 4.1.4 lint, render with the dev values, kubeconform 0.8.0 strict against Kubernetes 1.35.1, then assertions on the rendered manifests with yq 4.54.1 | a lint warning or error, a schema violation, or a rendered manifest that breaks the chart's contract, such as an Ingress path that is not a Public path |
+| `secrets` | gitleaks 8.30.1 with its default rules over every commit the PR brings, the ones reachable from the PR head but not from `main`, with full history fetched | any finding, including a secret added in one commit and removed in a later one, because it stays in the PR's history on GitHub |
 
 Each check is its own job, so a failure shows as its own red check on the PR. The check names are a contract with the [branch protection](#branch-protection) on `main`, which requires them by name. No job sets `name:`, so GitHub names each check after its job id. The PR page shows `PR / test (pull_request)`, but the name the ruleset matches is the bare job id, `test`. A job id therefore never changes unless the ruleset changes in the same PR. New Gates are added as new jobs at the end of the workflow, as new rows in this table, and as required checks in `scripts/protect-main.sh`.
 
@@ -173,17 +174,27 @@ To run the same checks locally:
 npm ci && npm test
 docker run --rm -i ghcr.io/hadolint/hadolint:v2.15.1 hadolint --failure-threshold warning - < Dockerfile
 scripts/check-chart.sh   # needs helm 4, kubeconform and yq 4 on PATH
+gitleaks git --redact --verbose --log-opts="origin/main..HEAD"   # needs gitleaks 8 on PATH
 ```
 
 ### Supply chain and permissions
 
 - Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
 - The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
-- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
+- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
+- gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
 - The workflow's default token permission is `contents: read` and nothing else. A job that needs more, such as pushing an image or creating a Release, asks for it in its own `permissions:` block.
 - `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps.
 - `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
 - A new push to a PR cancels that PR's run still in progress.
+
+## Security controls
+
+Each security control in the delivery path, where it is enforced, and what it stops.
+
+| Control | Where | What it stops |
+| --- | --- | --- |
+| Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 
 ## Branch protection
 
@@ -197,7 +208,7 @@ scripts/verify-protection.sh    # check what GitHub actually enforces
 The ruleset applies to `refs/heads/main` and is active:
 
 - **A pull request is required**, with zero approvals, because there is a single maintainer. The checks are the review. The ruleset itself also allows squash merges only.
-- **The required status checks are the PR jobs**: `test`, `dockerfile-lint` and `chart`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit will land on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
+- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart` and `secrets`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit will land on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
 - **Force-push and deletion of `main` are blocked.**
 - **Nobody can bypass it**, the repo admin included: the bypass list is empty. The Bump commit will be the one exception. The pipeline pushes it with a deploy key that goes on the bypass list ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)), added through the same script.
 
