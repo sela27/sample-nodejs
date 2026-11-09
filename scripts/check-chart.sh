@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Chart Gate: lints the Helm chart, renders it with the dev values, validates
-# the rendered manifests against the Kubernetes schemas, and checks what the
-# rendered manifests promise: only the Public paths behind the Ingress, probes
-# on the app's health endpoints, the ports, the pod hardening, the
-# ServiceAccount, and the standard labels.
+# Chart Gate: lints the Helm chart, renders it with the dev values (once as
+# is, once with Ingress TLS on), validates the rendered manifests against the
+# Kubernetes schemas, and checks what the rendered manifests promise: only the
+# Public paths behind the Ingress, probes on the app's health endpoints, the
+# ports, the pod hardening, the ServiceAccount, the standard labels, and that
+# the TLS flag adds the TLS section and the cert-manager issuer annotation and
+# nothing else.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits
@@ -23,6 +25,10 @@ CHART_DIR="$REPO_ROOT/gitops/charts/sample-nodejs"
 DEV_VALUES="$CHART_DIR/values-dev.yaml"
 # The same release name ArgoCD uses for the dev Environment.
 RELEASE="sample-nodejs-dev"
+# Ingress TLS is off by default. A second render turns it on with this
+# cert-manager ClusterIssuer name, which the checks then expect on the Ingress.
+TLS_ISSUER="check-chart-issuer"
+TLS_ON=(--set ingress.tls.enabled=true --set-string "ingress.tls.clusterIssuer=$TLS_ISSUER")
 
 for tool in helm kubeconform yq; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -34,6 +40,7 @@ done
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 rendered="$tmp_dir/dev.yaml"
+tls_rendered="$tmp_dir/dev-tls.yaml"
 
 failures=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -50,6 +57,12 @@ else
   fail "helm lint --strict"
 fi
 
+if helm lint --strict "$CHART_DIR" -f "$DEV_VALUES" "${TLS_ON[@]}"; then
+  pass "helm lint --strict with Ingress TLS on"
+else
+  fail "helm lint --strict with Ingress TLS on"
+fi
+
 if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" >"$rendered"; then
   pass "render with the dev values"
 else
@@ -57,10 +70,27 @@ else
   exit 1
 fi
 
-if kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" "$rendered"; then
-  pass "kubeconform -strict against Kubernetes $KUBERNETES_VERSION"
+if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" "${TLS_ON[@]}" >"$tls_rendered"; then
+  pass "render with the dev values and Ingress TLS on"
 else
-  fail "kubeconform -strict against Kubernetes $KUBERNETES_VERSION"
+  fail "render with the dev values and Ingress TLS on"
+  exit 1
+fi
+
+# With no issuer, cert-manager would ignore the Ingress and no certificate
+# would ever arrive, so the chart must refuse to render instead.
+if render_error="$(helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" --set ingress.tls.enabled=true 2>&1 >/dev/null)"; then
+  fail "Ingress TLS on without a ClusterIssuer does not render" "it rendered"
+elif [[ "$render_error" != *ingress.tls.clusterIssuer* ]]; then
+  fail "Ingress TLS on without a ClusterIssuer does not render" "failed for another reason: $render_error"
+else
+  pass "Ingress TLS on without a ClusterIssuer does not render"
+fi
+
+if kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" "$rendered" "$tls_rendered"; then
+  pass "kubeconform -strict against Kubernetes $KUBERNETES_VERSION, Ingress TLS off and on"
+else
+  fail "kubeconform -strict against Kubernetes $KUBERNETES_VERSION, Ingress TLS off and on"
 fi
 
 # What the rendered dev manifests must say. The expected values come from the
@@ -189,6 +219,8 @@ expect "one Ingress" "1" "$(q "[$ingress] | length")"
 expect "Ingress class" "traefik" "$(q "$ingress | .spec.ingressClassName")"
 # ADR-0002: no controller-specific annotations, so the controller can be swapped.
 expect "Ingress has no annotations" "0" "$(q "$ingress | .metadata.annotations // {} | length")"
+# Ingress TLS is off by default.
+expect "Ingress has no TLS section" "0" "$(q "$ingress | .spec.tls // [] | length")"
 expect "Ingress hosts" "$DEV_HOST" "$(q "[$ingress | .spec.rules[].host] | join(\" \")")"
 expect "Ingress paths are the Public paths only" "$PUBLIC_PATHS" \
   "$(q "[$ingress | .spec.rules[].http.paths[].path] | sort | join(\" \")")"
@@ -198,6 +230,30 @@ expect "Ingress backends are the Service" "$(q "$service | .metadata.name")" \
 for port_ref in $(q "[$backends | .port.number // .port.name] | unique | .[]"); do
   expect "Ingress backend port $port_ref is Service port $SERVICE_PORT" "$SERVICE_PORT" "$(service_port_number "$port_ref")"
 done
+
+# Ingress TLS on (ingress.tls.enabled). cert-manager sees the issuer
+# annotation, issues a certificate for the host in the TLS section and stores
+# it in the secret that section names; Traefik serves it.
+q_tls() { yq ea "$1" "$tls_rendered" | tr -d '\r'; }
+
+# The flag touches nothing else: without the Ingress's TLS section and
+# annotations, the TLS-on render is the default render, object for object.
+without_tls='with(select(.kind == "Ingress"); del(.spec.tls) | del(.metadata.annotations))'
+tls_diff="$(diff <(yq "$without_tls" "$rendered") <(yq "$without_tls" "$tls_rendered") || true)"
+expect "TLS on: only the Ingress's TLS section and annotations change" "no other change" \
+  "$([[ -z "$tls_diff" ]] && echo "no other change" || echo "${tls_diff//$'\n'/ | }")"
+
+expect "TLS on: one TLS entry" "1" "$(q_tls "[$ingress | .spec.tls[]] | length")"
+expect "TLS on: TLS hosts" "$DEV_HOST" "$(q_tls "[$ingress | .spec.tls[].hosts[]] | join(\" \")")"
+# cert-manager writes the certificate into this secret, and Traefik serves it.
+secret_name="$(q_tls "$ingress | .spec.tls[0].secretName")"
+expect "TLS on: TLS secret name is set" "set" \
+  "$([[ -n "$secret_name" && "$secret_name" != "null" ]] && echo set || echo unset)"
+# The one annotation the flag adds: it tells cert-manager which ClusterIssuer
+# signs the certificate. It is read by cert-manager, not by the Ingress
+# controller, so ADR-0002 still holds.
+expect "TLS on: Ingress annotations" "cert-manager.io/cluster-issuer=$TLS_ISSUER" \
+  "$(q_tls "[$ingress | .metadata.annotations // {} | to_entries | .[] | .key + \"=\" + .value] | join(\" \")")"
 
 # Standard app.kubernetes.io labels, on every object and on the pods. The outer
 # parentheses matter: in yq, `or` binds looser than `|`.
