@@ -10,6 +10,12 @@
 
 **Human step:** after the first push, confirm in the GHCR package settings that the package is private and linked to the repo, and take a screenshot of the package page.
 
+**Human step done (2026-11-10):**
+- The package had come out public, so the human switched it to Private.
+- The repo's Actions access was lowered from `Admin`, GitHub's default for the publishing repo, to `Write`.
+- The package page screenshot is `docs/screenshots/15-ghcr-package-private.png`.
+- Checked afterwards: anonymous manifest requests get 401 and 403, and a pod with `imagePullPolicy: Always` pulled `1.1.0` through `ghcr-pull`.
+
 **Verified before merge:** a semantic-release dry run over `main` plus this PR's commit, run the way the `version` job runs it, predicted `v1.0.0` with one Bug Fixes entry, the `fix(deps)` commit. Every other commit, this PR's `ci:` commit included, was analyzed as "should not trigger a release". actionlint 1.7.12 passes on the workflow. The criteria below that need a real run on `main` stay open until the first run after the merge.
 
 - [x] A workflow triggers on push to `main`, inside a concurrency group that never cancels a run in progress. Bump commits marked `[skip ci]` do not trigger it. (GitHub skips push workflows for a `[skip ci]` head commit on its own; ticket 16 sees it happen on the first Bump commit.)
