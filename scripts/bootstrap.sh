@@ -4,7 +4,13 @@
 #
 # Runs from Git Bash on Windows and natively on Linux and macOS.
 #
+# Required:
+#   GHCR_PULL_TOKEN     a classic GitHub personal access token with only the
+#                       read:packages scope. Bootstrap stores it in the app
+#                       namespace as the registry pull secret and never prints it.
+#
 # Variables (all optional):
+#   GHCR_PULL_USER      GitHub user the token belongs to       (default: sela27)
 #   MINIKUBE_PROFILE    minikube profile and kubectl context   (default: minikube)
 #   MINIKUBE_CPUS       CPUs for the minikube node             (default: 4)
 #   MINIKUBE_MEMORY     memory for the minikube node, in MiB   (default: 4096)
@@ -16,6 +22,7 @@
 #                       before they merge; re-run with the default afterwards.
 set -euo pipefail
 
+GHCR_PULL_USER="${GHCR_PULL_USER:-sela27}"
 MINIKUBE_PROFILE="${MINIKUBE_PROFILE:-minikube}"
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-4096}"
@@ -26,6 +33,15 @@ GIT_REPO_URL="${GIT_REPO_URL:-https://github.com/sela27/sample-nodejs.git}"
 GIT_REVISION="${GIT_REVISION:-main}"
 
 APP_HOST="sample-nodejs.127.0.0.1.nip.io"
+APP_IMAGE="ghcr.io/sela27/sample-nodejs"
+# The dev Environment's ArgoCD Application (gitops/apps/sample-nodejs-dev.yaml)
+# and the namespace it deploys into.
+APP="sample-nodejs-dev"
+APP_NAMESPACE="sample-nodejs-dev"
+# The registry pull secret, by the name the chart's ServiceAccount refers to
+# (image.pullSecret in gitops/charts/sample-nodejs/values.yaml).
+PULL_SECRET="ghcr-pull"
+REGISTRY="ghcr.io"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -45,7 +61,8 @@ wait_until() {
   until "$@"; do
     if ((SECONDS >= deadline)); then
       printf '\n'
-      die "timed out after ${timeout}s waiting for ${what}. Inspect with: kubectl --context ${MINIKUBE_PROFILE} -n argocd get applications"
+      die "timed out after ${timeout}s waiting for ${what}. Inspect with: kubectl --context ${MINIKUBE_PROFILE} -n argocd get applications
+and: kubectl --context ${MINIKUBE_PROFILE} get pods --all-namespaces (ImagePullBackOff in ${APP_NAMESPACE} means the registry refused GHCR_PULL_TOKEN)"
     fi
     printf '.'
     sleep 5
@@ -60,6 +77,21 @@ app_synced() { [[ "$(app_status "$1" '{.status.sync.status}')" == "Synced" ]]; }
 app_synced_and_healthy() { [[ "$(app_status "$1" '{.status.sync.status}/{.status.health.status}')" == "Synced/Healthy" ]]; }
 deployment_available() {
   [[ "$(k -n "$1" get deployment "$2" -o jsonpath='{.status.availableReplicas}' 2>/dev/null | tr -d '\r')" =~ ^[1-9] ]]
+}
+
+# The registry pull secret needs the token (ADR-0003). It is checked before
+# anything else, so a missing token stops the run before it changes anything.
+# The test asks only whether it is set, so that not even `bash -x` prints it.
+check_pull_token() {
+  [[ "$GHCR_PULL_USER" =~ ^[A-Za-z0-9-]+$ ]] || die "GHCR_PULL_USER '${GHCR_PULL_USER}' is not a GitHub user name."
+  [[ "${GHCR_PULL_TOKEN:+set}" == "set" ]] && return 0
+  die "GHCR_PULL_TOKEN is not set. Bootstrap needs it to create the registry pull secret for the private image ${APP_IMAGE}.
+Create a classic personal access token with only the read:packages scope
+(GitHub > Settings > Developer settings > Personal access tokens > Tokens (classic)),
+then read it without echo, so it stays out of your shell history, and re-run:
+  read -rs GHCR_PULL_TOKEN   # paste the token, press Enter
+  export GHCR_PULL_TOKEN
+  scripts/bootstrap.sh"
 }
 
 check_prerequisites() {
@@ -113,6 +145,50 @@ install_argocd() {
     --timeout 10m
 }
 
+# The dev Environment's namespace. Bootstrap creates it, rather than leaving it
+# to ArgoCD, because the pull secret must be in it before the app's first pod
+# starts. Its labels make every pod in it meet the restricted Pod Security
+# profile (enforce), and also record (audit) and warn about (warn, shown when a
+# workload is applied) any workload that would not. Server-side apply keeps a
+# re-run idempotent and puts the labels back if they were changed.
+create_app_namespace() {
+  log "Creating namespace ${APP_NAMESPACE} with the restricted Pod Security labels"
+  k apply --server-side --force-conflicts --field-manager=bootstrap -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${APP_NAMESPACE}
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+EOF
+}
+
+# The registry pull secret for the private image: the one object in the
+# cluster that does not come from git (ADR-0003). The chart's ServiceAccount
+# names it. The function body is a subshell with xtrace off, and the token
+# reaches kubectl on stdin through printf, a shell builtin, so neither
+# `bash -x` nor the process list shows it. Server-side apply keeps a re-run
+# idempotent, and a re-run with a new token replaces the old one.
+create_pull_secret() (
+  set +x
+  log "Creating the registry pull secret ${PULL_SECRET} in namespace ${APP_NAMESPACE} (token not shown)"
+  local auth config
+  auth="$(printf '%s:%s' "$GHCR_PULL_USER" "$GHCR_PULL_TOKEN" | base64 | tr -d '\n')"
+  config="$(printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth" | base64 | tr -d '\n')"
+  printf 'apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: %s
+' "$PULL_SECRET" "$APP_NAMESPACE" "$config" |
+    k apply --server-side --force-conflicts --field-manager=bootstrap -f -
+)
+
 # The committed manifest follows main; GIT_REPO_URL and GIT_REVISION override it.
 apply_root_app() {
   [[ "$GIT_REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || die "GIT_REVISION '${GIT_REVISION}' is not a branch, tag or commit name."
@@ -125,13 +201,18 @@ apply_root_app() {
 }
 
 # The Traefik Application stays Progressing until `minikube tunnel` gives its
-# LoadBalancer Service an address, so Bootstrap waits for Synced and a running
-# Traefik rather than for Healthy.
+# LoadBalancer Service an address, and so does the app's, because Traefik
+# copies that address onto the app's Ingress. So Bootstrap waits for each to
+# be Synced and its Deployment available rather than for Healthy. The app's
+# Deployment is available once its pods pass the readiness probe, which needs
+# the image pulled with the token.
 wait_for_applications() {
   log "Waiting for ArgoCD to sync the Applications from git"
   wait_until 300 "the root Application to be Synced and Healthy" app_synced_and_healthy root
   wait_until 300 "the traefik Application to be Synced" app_synced traefik
   wait_until 300 "Traefik to be available" deployment_available traefik traefik
+  wait_until 300 "the ${APP} Application to be Synced" app_synced "$APP"
+  wait_until 300 "the app to be available" deployment_available "$APP_NAMESPACE" "$APP"
 }
 
 print_next_steps() {
@@ -152,20 +233,23 @@ Ingress on localhost: in a separate terminal, run this and keep it running
 (it may ask for admin rights, because it binds ports 80 and 443):
   minikube tunnel -p ${MINIKUBE_PROFILE}
 
-With the tunnel up, http://${APP_HOST}/ answers Traefik's
-"404 page not found" until the app is deployed:
-  curl -i http://${APP_HOST}/
+With the tunnel up, the app answers "Hello, World!" in the browser at the URL
+below, and ArgoCD shows both Applications Healthy:
+  http://${APP_HOST}/my-app
 
-Check the cluster state at any time (the tunnel check runs while the tunnel is up):
+Check the cluster state at any time (the tunnel checks run while the tunnel is up):
   ${verify}
 EOF
 }
 
 main() {
+  check_pull_token
   check_prerequisites
   start_minikube
   enable_metrics_server
   install_argocd
+  create_app_namespace
+  create_pull_secret
   apply_root_app
   wait_for_applications
   print_next_steps

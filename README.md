@@ -18,13 +18,24 @@ A lightweight Node.js application. It features basic web endpoints, Prometheus m
 
 ## Quick start
 
-One command brings up a local cluster in which ArgoCD manages everything else from git. You need Docker (Docker Desktop on Windows and macOS), minikube, kubectl and Helm. The script runs from Git Bash on Windows and from bash on Linux and macOS.
+One command brings up a local cluster in which ArgoCD manages everything else from git, and Deploys the app to the `dev` Environment. You need Docker (Docker Desktop on Windows and macOS), minikube, kubectl and Helm. The script runs from Git Bash on Windows and from bash on Linux and macOS.
+
+The image `ghcr.io/sela27/sample-nodejs` is a private package, so the cluster needs a token to pull it. Create a classic personal access token with only the `read:packages` scope (GitHub, Settings, Developer settings, Personal access tokens, Tokens (classic)). Then read it into `GHCR_PULL_TOKEN` without echo, so it stays out of your shell history, and run the script:
 
 ```bash
+read -rs GHCR_PULL_TOKEN   # paste the token, then press Enter
+export GHCR_PULL_TOKEN
 scripts/bootstrap.sh
 ```
 
-The script starts minikube with the Calico CNI (so NetworkPolicies are enforced) and the metrics-server addon, installs ArgoCD from its pinned Helm chart, and applies the root Application (`gitops/bootstrap/root-app.yaml`). ArgoCD then installs everything declared under `gitops/apps` on `main`. For now that is the Traefik ingress controller ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)). Re-running the script is safe, because it reuses a running cluster and upgrades ArgoCD in place. It ends by printing how to read the ArgoCD admin password and how to open the ArgoCD UI.
+Without the token, the script stops at once with a message saying what to set, before it changes anything.
+
+The script starts minikube with the Calico CNI (so NetworkPolicies are enforced) and the metrics-server addon, and installs ArgoCD from its pinned Helm chart. It creates the app namespace `sample-nodejs-dev` with the [restricted Pod Security](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted) labels (`enforce`, `audit` and `warn`), and in it the registry pull secret `ghcr-pull` from the token. That secret is the one object in the cluster that does not come from git ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)). The script never prints the token, not even under `bash -x`, and passes it to kubectl on stdin, so it does not show in the process list either. Then it applies the root Application (`gitops/bootstrap/root-app.yaml`), and ArgoCD installs everything declared under `gitops/apps` on `main`:
+
+- `traefik.yaml`: the Traefik ingress controller ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)).
+- `sample-nodejs-dev.yaml`: the app, from our chart with `values-dev.yaml`, in the `sample-nodejs-dev` namespace. It syncs automatically with prune and self-heal, so each [Bump commit](#bump-commit) on `main` is Deployed with no manual step.
+
+The script waits until the app's Application is Synced and its pods pass the readiness probe. Re-running it is safe, because it reuses a running cluster, upgrades ArgoCD in place and updates the namespace and the pull secret in place. To rotate the token, re-run it with the new one. It ends by printing how to read the ArgoCD admin password, how to open the ArgoCD UI, and the app URL.
 
 Then start the tunnel in a separate terminal and leave it running. It may ask for admin rights, because it binds ports 80 and 443 on localhost:
 
@@ -32,10 +43,14 @@ Then start the tunnel in a separate terminal and leave it running. It may ask fo
 minikube tunnel
 ```
 
-With the tunnel up, `http://sample-nodejs.127.0.0.1.nip.io/` answers with Traefik's own `404 page not found`, because no app route exists yet. `scripts/verify-bootstrap.sh` checks the whole setup and prints PASS, FAIL or SKIP for each check. The tunnel check runs only while the tunnel is up.
+With the tunnel up, open the app in the browser at [http://sample-nodejs.127.0.0.1.nip.io/my-app](http://sample-nodejs.127.0.0.1.nip.io/my-app). It answers `Hello, World!`. Only the Public paths `/my-app` and `/about` have a route, so `/` and every other path get Traefik's own `404 page not found`. The tunnel also turns both Applications Healthy in ArgoCD. Until then they show Progressing: ArgoCD rates a LoadBalancer Service and an Ingress Progressing until they have an address, and the tunnel gives Traefik's Service one, which Traefik copies onto the app's Ingress.
+
+`scripts/verify-bootstrap.sh` checks the whole setup and prints PASS, FAIL or SKIP for each check: the cluster, ArgoCD, Traefik, the namespace labels, the pull secret, the app's Application (source, sync policy, Synced, Healthy or waiting for the tunnel), that the app process runs as uid 1000, and `/my-app` through Traefik. The tunnel checks run only while the tunnel is up; the other HTTP checks go through a port-forward.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `GHCR_PULL_TOKEN` | none, required | Classic personal access token with only `read:packages`, stored as the pull secret `ghcr-pull` |
+| `GHCR_PULL_USER` | `sela27` | GitHub user the token belongs to |
 | `MINIKUBE_PROFILE` | `minikube` | minikube profile and kubectl context |
 | `MINIKUBE_CPUS` | `4` | CPUs for the minikube node |
 | `MINIKUBE_MEMORY` | `4096` | Memory for the minikube node, in MiB |
@@ -468,7 +483,8 @@ Each security control in the delivery path, where it is enforced, and what it st
 | All Linux capabilities dropped | Container `capabilities.drop: [ALL]` | The process holding or regaining kernel privileges, such as opening raw sockets, changing file ownership or bypassing file permissions. |
 | `RuntimeDefault` seccomp profile | Pod `seccompProfile` | System calls outside the container runtime's default allowlist, which shrinks the kernel surface an exploit can reach. |
 | No Kubernetes API token | ServiceAccount and pod `automountServiceAccountToken: false` | A compromised pod using an API token to read or change cluster objects. |
-| Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)) | The `read:packages` token reaching the repo. |
+| Restricted Pod Security admission | Labels `pod-security.kubernetes.io/enforce`, `audit` and `warn` set to `restricted` on the `sample-nodejs-dev` namespace by Bootstrap | Any pod in the app namespace that breaks the restricted profile, whatever its chart says: the API server refuses to create it. |
+| Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)), which never prints the token | The `read:packages` token reaching the repo or a log. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |

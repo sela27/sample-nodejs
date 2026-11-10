@@ -1,0 +1,39 @@
+# The dev Environment: our chart with the dev values, deployed by ArgoCD.
+# ArgoCD renders the chart from main, so a Bump commit there (a new image tag in
+# values-dev.yaml) or a chart change is Deployed with no manual step.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-nodejs-dev
+  namespace: argocd
+  # Deleting this Application (or removing this file from git) also deletes
+  # the app resources it created. The namespace and the pull secret stay,
+  # because Bootstrap created them, not ArgoCD.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sela27/sample-nodejs.git
+    targetRevision: main
+    path: gitops/charts/sample-nodejs
+    helm:
+      # Object names start with the release name (sample-nodejs-dev), the
+      # release name scripts/check-chart.sh renders the chart with.
+      releaseName: sample-nodejs-dev
+      valueFiles:
+        - values-dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    # Bootstrap creates this namespace first, with the restricted Pod Security
+    # labels and the registry pull secret (ADR-0003).
+    namespace: sample-nodejs-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # Bootstrap normally creates the namespace already. If it is missing,
+      # ArgoCD creates it, without the labels or the pull secret, and a re-run
+      # of Bootstrap adds both.
+      - CreateNamespace=true
