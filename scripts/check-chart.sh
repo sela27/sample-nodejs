@@ -4,7 +4,8 @@
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
-# rollout checksum, the standard labels, and that the TLS flag adds the TLS
+# rollout checksum, the NetworkPolicy that admits only Traefik to the app
+# port, the standard labels, and that the TLS flag adds the TLS
 # section and the cert-manager issuer annotation and nothing else.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
