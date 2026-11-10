@@ -2,7 +2,9 @@
 # Each Environment's values file (values-<environment>.yaml) adds the image and
 # the Ingress host.
 
-replicaCount: 1
+# The replica count, used only while the HPA is off (autoscaling.enabled).
+# Two, so the PodDisruptionBudget still lets one pod go during a node drain.
+replicaCount: 2
 
 # The app's configuration. The chart puts it in a ConfigMap that the container
 # loads as environment variables, and a change to it rolls the pods.
@@ -32,6 +34,20 @@ resources:
   limits:
     cpu: 250m
     memory: 128Mi
+
+# The HorizontalPodAutoscaler. It adds pods when the average CPU use passes the
+# target, a share of the CPU request above, and removes them when it falls.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+# Voluntary disruptions, such as a node drain, keep at least this many pods
+# serving. It stays below the fewest pods the Deployment runs (minReplicas, or
+# replicaCount with the HPA off), or no pod could ever be evicted.
+podDisruptionBudget:
+  minAvailable: 1
 
 ingress:
   className: traefik

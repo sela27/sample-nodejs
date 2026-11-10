@@ -5,7 +5,12 @@ metadata:
   labels:
     {{- include "sample-nodejs.labels" . | nindent 4 }}
 spec:
+  # With the HPA on, the HPA owns the replica count and the Deployment leaves
+  # it out. If the Deployment set it, every ArgoCD sync would put back the
+  # count from git over the count the HPA chose.
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "sample-nodejs.selectorLabels" . | nindent 6 }}

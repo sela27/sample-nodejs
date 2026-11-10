@@ -4,8 +4,9 @@
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
-# rollout checksum, the standard labels, and that the TLS flag adds the TLS
-# section and the cert-manager issuer annotation and nothing else.
+# rollout checksum, the HPA and the PodDisruptionBudget, the standard labels,
+# and that the TLS flag adds the TLS section and the cert-manager issuer
+# annotation and nothing else.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits
@@ -116,6 +117,13 @@ PULL_SECRET="ghcr-pull"
 NODE_ENV_VALUE="production"
 # The pod template annotation that carries a checksum of the ConfigMap.
 CHECKSUM_ANNOTATION="checksum/config"
+
+# Autoscaling (spec, Helm chart): an HPA between two and five replicas at 70%
+# CPU, and a PodDisruptionBudget that keeps one pod serving.
+HPA_MIN_REPLICAS="2"
+HPA_MAX_REPLICAS="5"
+HPA_CPU_UTILIZATION="70"
+PDB_MIN_AVAILABLE="1"
 
 # Evaluates a yq expression over all documents of a rendered file at once.
 qf() { yq ea "$2" "$1" | tr -d '\r'; }
@@ -330,9 +338,89 @@ fi
 # A values change outside the ConfigMap keeps the checksum, so it causes no
 # rollout of its own. This also catches a checksum that differs between two
 # renders of the same configuration, which ArgoCD would show as constant drift.
-if render_with replicas --set replicaCount=3; then
+# The HPA is turned off here, so that replicaCount reaches the Deployment.
+if render_with replicas --set autoscaling.enabled=false --set replicaCount=3; then
   expect "a change outside the ConfigMap keeps the checksum" "$dev_checksum" \
     "$(checksum_of "$tmp_dir/replicas.yaml")"
+fi
+
+# Autoscaling: an HPA moves the Deployment between two and five replicas on
+# CPU, and the values set all three numbers.
+hpa='select(.kind == "HorizontalPodAutoscaler")'
+cpu_target="$hpa | .spec.metrics[] | select(.type == \"Resource\" and .resource.name == \"cpu\") | .resource.target"
+
+expect "one HPA" "1" "$(q "[$hpa] | length")"
+expect "HPA API version" "autoscaling/v2" "$(q "$hpa | .apiVersion")"
+expect "HPA scales the Deployment" "apps/v1 Deployment $(q "$deployment | .metadata.name")" \
+  "$(q "$hpa | .spec.scaleTargetRef | .apiVersion + \" \" + .kind + \" \" + .name")"
+expect "HPA min replicas" "$HPA_MIN_REPLICAS" "$(q "$hpa | .spec.minReplicas")"
+expect "HPA max replicas" "$HPA_MAX_REPLICAS" "$(q "$hpa | .spec.maxReplicas")"
+expect "HPA scales on CPU only" "Resource/cpu" "$(q "[$hpa | .spec.metrics[] | .type + \"/\" + .resource.name] | join(\" \")")"
+expect "HPA CPU target type" "Utilization" "$(q "$cpu_target | .type")"
+expect "HPA CPU target" "$HPA_CPU_UTILIZATION" "$(q "$cpu_target | .averageUtilization")"
+
+if render_with hpa-values --set autoscaling.minReplicas=3 --set autoscaling.maxReplicas=7 \
+  --set autoscaling.targetCPUUtilizationPercentage=60; then
+  variant="$tmp_dir/hpa-values.yaml"
+  expect "HPA numbers from the values: min, max, CPU target" "3 7 60" \
+    "$(qf "$variant" "$hpa | .spec.minReplicas") $(qf "$variant" "$hpa | .spec.maxReplicas") $(qf "$variant" "$cpu_target | .averageUtilization")"
+fi
+
+# The CPU target is a share of the pods' CPU requests, so every container of
+# the pods the HPA scales sets one. With neither a CPU request nor a CPU limit,
+# the HPA has no utilization to read and never scales; with only a limit,
+# Kubernetes copies the limit into the request, which quietly moves the target.
+hpa_containers="select(.kind == \"Deployment\" and .metadata.name == \"$(q "$hpa | .spec.scaleTargetRef.name")\") | .spec.template.spec.containers[]"
+without_request="$(q "[$hpa_containers | select(.resources.requests.cpu == null) | .name] | join(\" \")")"
+if [[ "$(q "[$hpa_containers] | length")" == "0" ]]; then
+  without_request="no containers: the HPA's target is not a rendered Deployment"
+elif [[ -n "$without_request" ]]; then
+  without_request="no CPU request on: $without_request"
+fi
+expect "every container the HPA scales has a CPU request" "all set" "${without_request:-all set}"
+
+# While the HPA is on, the Deployment leaves `replicas` to it. If the
+# Deployment set it, every ArgoCD sync would put back the count from git over
+# the count the HPA chose, and the two would fight.
+expect "Deployment leaves replicas to the HPA" "unset" "$(q "$deployment | .spec.replicas // \"unset\"")"
+
+# With the HPA off, there is no HPA, and replicaCount sets the replicas.
+if render_with hpa-off --set autoscaling.enabled=false --set replicaCount=3; then
+  variant="$tmp_dir/hpa-off.yaml"
+  expect "HPA off: no HPA" "0" "$(qf "$variant" "[$hpa] | length")"
+  expect "HPA off: Deployment replicas from replicaCount" "3" \
+    "$(qf "$variant" "$deployment | .spec.replicas // \"unset\"")"
+fi
+
+# A PodDisruptionBudget keeps one pod serving through voluntary disruptions,
+# such as a node drain: the eviction API refuses to evict a pod when that would
+# leave fewer than minAvailable pods ready.
+pdb='select(.kind == "PodDisruptionBudget")'
+
+expect "one PodDisruptionBudget" "1" "$(q "[$pdb] | length")"
+expect "PDB minAvailable" "$PDB_MIN_AVAILABLE" "$(q "$pdb | .spec.minAvailable")"
+pdb_selector="$(q "$pdb | .spec.selector.matchLabels | to_entries | .[] | .key + \"=\" + .value" | sort)"
+unmatched="$(comm -23 <(printf '%s\n' "$pdb_selector") <(printf '%s\n' "$pod_labels"))"
+expect "PDB selects the app pods" "selects" \
+  "$([[ -n "$pdb_selector" && -z "$unmatched" ]] && echo selects || echo "selector '${pdb_selector//$'\n'/,}' not on pods")"
+
+# minAvailable must stay below the fewest pods the Deployment runs, or no pod
+# could ever be evicted and a node drain would wait forever. Prints "room" if
+# the PDB in the rendered file $1 lets one pod go when $2 pods run.
+pdb_room() {
+  local min_available
+  min_available="$(qf "$1" "$pdb | .spec.minAvailable")"
+  if [[ "$min_available" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]] && ((min_available < $2)); then
+    echo room
+  else
+    echo "no room: minAvailable $min_available with $2 pods"
+  fi
+}
+expect "PDB lets a pod go at the HPA's minimum" "room" "$(pdb_room "$rendered" "$(q "$hpa | .spec.minReplicas")")"
+if render_with hpa-off-default --set autoscaling.enabled=false; then
+  variant="$tmp_dir/hpa-off-default.yaml"
+  expect "HPA off: PDB lets a pod go at the default replicaCount" "room" \
+    "$(pdb_room "$variant" "$(qf "$variant" "$deployment | .spec.replicas")")"
 fi
 
 ingress='select(.kind == "Ingress")'
