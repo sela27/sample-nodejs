@@ -9,7 +9,7 @@
 **Status:** done
 
 - [x] A NetworkPolicy that selects the app pods allows ingress on the app port only from the Traefik namespace, matched by its namespace-name label, and from Traefik's pods.
-- [ ] The smoke test still passes.
+- [x] The smoke test still passes. (2026-11-10, with the NetworkPolicy enforced by Calico: `scripts/smoke-test.sh` passed all five paths through `minikube tunnel`, and again over HTTPS after ticket 31, so Traefik still reaches the app port and nothing else is exposed.)
 - [x] From a throwaway pod in another namespace, a request to the app Service times out. The command and its output are recorded in the README.
 - [x] The README security-controls list includes the NetworkPolicy, and notes that it depends on Calico being enforced.
 - [x] PR title is `chore(chart): …`. Status set to `done` in the same PR.

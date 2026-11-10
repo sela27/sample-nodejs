@@ -16,9 +16,9 @@
 - [x] ArgoCD is installed from its Helm chart at a pinned version. The script waits until it is ready, and re-running upgrades it in place.
 - [x] The root Application (app-of-apps) is applied, pointing at the child-Applications directory on `main` of the public repo.
 - [x] A Traefik child Application uses the official chart at a pinned version, a LoadBalancer Service, automated sync with prune and self-heal, and namespace creation.
-- [ ] With the tunnel running, a request to `http://sample-nodejs.127.0.0.1.nip.io/` gets Traefik's own 404 (no app route yet).
+- [x] With the tunnel running, a request to `http://sample-nodejs.127.0.0.1.nip.io/` gets Traefik's own 404 (no app route yet). (Verified 2026-11-10 with the human's `minikube tunnel` running: `scripts/verify-bootstrap.sh` passed all 25 checks, including "answers Traefik's 404 through the tunnel, and traefik is Healthy". By then the app route existed, so `/` was the path with no route.)
 - [x] The script prints how to read the ArgoCD admin password, how to open the ArgoCD UI, and the tunnel instruction.
 - [x] The README gains a "Quick start" section.
 - [x] PR title is `chore(cluster): …`. Status set to `done` in the same PR.
 
-The tunnel criterion is left for the human. The agent checked Traefik's 404 for the same Host through a port-forward. To close the criterion, run `minikube tunnel` in a separate terminal, then run `scripts/verify-bootstrap.sh`. Its tunnel check runs instead of SKIP and must PASS.
+The tunnel criterion was left for the human, and is now closed (see above). The agent checked Traefik's 404 for the same Host through a port-forward. To close the criterion, run `minikube tunnel` in a separate terminal, then run `scripts/verify-bootstrap.sh`. Its tunnel check runs instead of SKIP and must PASS.

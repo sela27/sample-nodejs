@@ -103,6 +103,16 @@ All paths passed.
 
 A failure names the path, what it expected and what it got, for example `FAIL  /classified  expected 404, got 200` if the Ingress exposed an internal path. If nothing answers, the script says to start the tunnel or use `--port-forward`. On Windows, run it from Git Bash.
 
+The same Deploy, checked by hand on 2026-11-10 with `minikube tunnel` running. A browser gets the app on a Public path, and Traefik's own 404 on an internal one:
+
+![/my-app in the browser: Hello, World!](docs/screenshots/19-my-app-in-browser.png)
+
+![/classified in the browser: 404 page not found](docs/screenshots/20-classified-404-in-browser.png)
+
+ArgoCD shows `sample-nodejs-dev` Synced to `main` and Healthy, with every object the chart renders: ConfigMap, Service, ServiceAccount, Deployment and its ReplicaSets and pods, HPA, Ingress and its Certificate, NetworkPolicy and PodDisruptionBudget:
+
+![ArgoCD: the sample-nodejs-dev application tree, Synced and Healthy](docs/screenshots/20-argocd-app-tree-synced-healthy.png)
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `APP_HOST` | `sample-nodejs.127.0.0.1.nip.io` | Ingress host of the Environment, sent as the `Host` header |
@@ -342,6 +352,10 @@ scripts/smoke-test.sh --port-forward --https        # the certificate is verifie
 | minikube container memory (`docker stats`) | about 2.6 GiB of 4 GiB | 2.89 GiB of 4 GiB |
 | cert-manager pods (`kubectl top`) | n/a | controller 27 Mi, cainjector 29 Mi, webhook 12 Mi |
 
+In the browser, `https://sample-nodejs.127.0.0.1.nip.io/my-app` serves the app with the expected warning, because no trusted CA signed the certificate. The certificate is cert-manager's: issued 2026-11-10 for the Ingress host, valid for 90 days, with no subject or issuer name of its own (the host is in the subject alternative names):
+
+![The app over HTTPS, with the certificate viewer open](docs/screenshots/31-app-over-https.png)
+
 ### Turning monitoring on
 
 The app serves Prometheus text on `/metrics`, including `root_access_total`. The Ingress does not route that path, so Prometheus has to reach the Service from inside the cluster, and the NetworkPolicy has to let it in. One flag does both:
@@ -507,6 +521,10 @@ docker run --rm -v "$PWD:/sbom:ro" cyclonedx/cyclonedx-cli:0.33.1 \
 jq -r '.metadata.component.properties[] | select(.name == "aquasecurity:trivy:RepoDigest").value' "sample-nodejs-$v.cdx.json"
 trivy sbom --severity HIGH,CRITICAL "sample-nodejs-$v.cdx.json"   # the image's vulnerabilities as of today
 ```
+
+The `v1.1.0` Release, with the SBOM among its assets:
+
+![GitHub Release v1.1.0 with sample-nodejs-1.1.0.cdx.json attached](docs/screenshots/27-release-with-sbom.png)
 
 ### Dependabot
 
