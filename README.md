@@ -181,6 +181,7 @@ Every pull request to `main` runs these checks, defined in `.github/workflows/pr
 | `chart` | `scripts/check-chart.sh`: helm 4.1.4 lint, render with the dev values, kubeconform 0.8.0 strict against Kubernetes 1.35.1, then assertions on the rendered manifests with yq 4.54.1 | a lint warning or error, a schema violation, or a rendered manifest that breaks the chart's contract, such as an Ingress path that is not a Public path |
 | `secrets` | gitleaks 8.30.1 with its default rules over every commit the PR brings, the ones reachable from the PR head but not from `main`, with full history fetched | any finding, including a secret added in one commit and removed in a later one, because it stays in the PR's history on GitHub |
 | `image-gate` | builds the image with BuildKit and keeps it on the runner, then scans it with Trivy 0.76.2 ([Image Gate](#image-gate)) | any HIGH or CRITICAL vulnerability, including one with no fixed version yet, that `.trivyignore` does not list |
+| `iac-gate` | `scripts/check-iac.sh`: Trivy 0.76.2's misconfiguration checks over the `Dockerfile` and the chart rendered by helm 4.1.4 with the dev values ([IaC Gate](#iac-gate)) | any HIGH or CRITICAL misconfiguration that `.trivyignore` does not list, such as a container without a read-only root filesystem |
 
 Each check is its own job, so a failure shows as its own red check on the PR. The check names are a contract with the [branch protection](#branch-protection) on `main`, which requires them by name. No job sets `name:`, so GitHub names each check after its job id. The PR page shows `PR / test (pull_request)`, but the name the ruleset matches is the bare job id, `test`. A job id therefore never changes unless the ruleset changes in the same PR. New Gates are added as new jobs at the end of the workflow, as new rows in this table, and as required checks in `scripts/protect-main.sh`.
 
@@ -193,6 +194,7 @@ scripts/check-chart.sh   # needs helm 4, kubeconform and yq 4 on PATH
 gitleaks git --redact --verbose --log-opts="origin/main..HEAD"   # needs gitleaks 8 on PATH
 docker build -t sample-nodejs:local . && trivy image --image-src docker --scanners vuln \
   --severity HIGH,CRITICAL --ignorefile .trivyignore --exit-code 1 sample-nodejs:local   # needs trivy 0.76.2
+scripts/check-iac.sh     # needs helm 4 and trivy 0.76.2 on PATH
 ```
 
 ### Image Gate
@@ -238,13 +240,43 @@ Express stays on 4.x, `npm audit` reports 0 vulnerabilities, the tests pass, and
 
 Like the other tools hosted on GitHub releases, the file is fetched through the GitHub API with the job's read-only token, not from the anonymous `github.com/.../releases/download` URL. That URL returned 504 during a GitHub incident on 2026-11-09 and failed this PR's first run, while the API kept serving the same file.
 
-**The ignore file.** `.trivyignore` lists the vulnerability IDs the Gate accepts, and it is empty. Fixing means a dependency or base-image update, not an entry there. An entry is allowed only for a finding that cannot be fixed yet, with a comment directly above it giving both the justification (why it cannot be fixed now, for example no fixed version exists) and the reason it is safe (why the vulnerable code cannot be reached or exploited in this image). An entry without both is not merged, and the PR that ships the fix removes the entry.
+**The ignore file.** `.trivyignore` lists the vulnerability IDs the Gate accepts, and it is empty. The [IaC Gate](#iac-gate) reads the same file, under the same rules. Fixing means a dependency or base-image update, not an entry there. An entry is allowed only for a finding that cannot be fixed yet, with a comment directly above it giving both the justification (why it cannot be fixed now, for example no fixed version exists) and the reason it is safe (why the vulnerable code cannot be reached or exploited in this image). An entry without both is not merged, and the PR that ships the fix removes the entry.
+
+### IaC Gate
+
+`iac-gate` runs `scripts/check-iac.sh`, and blocks the PR while the `Dockerfile` or the chart carries a HIGH or CRITICAL misconfiguration. The script runs the same way locally and in CI:
+
+1. helm renders the chart with the dev values and the dev release name, as ArgoCD does for `dev`. Trivy scans these rendered manifests, not the raw templates, so each finding is about an object that would be applied, with the values filled in, and names that object.
+2. `trivy config` runs its Dockerfile and Kubernetes checks over the `Dockerfile` and the rendered manifests, in one run.
+3. Any HIGH or CRITICAL finding fails the check, unless `.trivyignore` lists it with a justification. The findings are printed in the job log.
+
+The `chart` check asserts the settings this chart promises. The IaC Gate adds Trivy's general rules, which also cover what the chart check does not name, such as a privileged container, the host's network or an image that runs as root.
+
+**The checks are pinned with the binary.** By default, Trivy fetches the latest bundle of its checks from a container registry (`mirror.gcr.io/aquasec/trivy-checks`) and keeps it in its cache. The script passes `--skip-check-update` and an empty cache directory of its own, so Trivy uses the checks embedded in the 0.76.2 binary, never a bundle that an earlier run left in the cache. The checks are then pinned by the binary's version and SHA-256, the scan makes no download that could flake, and a local run applies exactly the checks CI applies. New checks arrive with a Trivy upgrade, in a PR of their own, instead of turning an unrelated PR red. Trivy logs `Falling back to embedded checks` at ERROR level on every run; that is this intended path, not a failure. The job's only downloads are helm and Trivy, with retries and through the GitHub API, as in the other jobs.
+
+**It fails when the hardening goes.** Checked locally, without committing: with `readOnlyRootFilesystem: true` deleted from the Deployment template, `scripts/check-iac.sh` exits 1 with:
+
+```text
+sample-nodejs-dev.yaml (kubernetes)
+Failures: 1 (HIGH: 1, CRITICAL: 0)
+KSV-0014 (HIGH): Container 'app' of Deployment 'sample-nodejs-dev' should set 'securityContext.readOnlyRootFilesystem' to true
+```
+
+**The current repo passes**: no HIGH or CRITICAL finding, so nothing needed a fix and `.trivyignore` has no entry for this Gate. The scan's lower findings do not fail the check and are not printed. They are, in Trivy 0.76.2:
+
+| Check | Severity | Finding | Why it stays |
+| --- | --- | --- | --- |
+| `DS-0026` | LOW | No `HEALTHCHECK` in the `Dockerfile` | Kubernetes ignores the image's `HEALTHCHECK` and runs its own probes on `/live` and `/ready`. |
+| `KSV-0020`, `KSV-0021` | LOW | uid and gid not above 10000 | The pod runs as the image's `node` user, uid and gid 1000, as non-root, with every capability dropped and no privilege escalation. |
+| `KSV-01010` | MEDIUM | "Sensitive content" in the ConfigMap | A false positive on the key name `PORT`. The ConfigMap holds only `PORT` and `NODE_ENV`. |
+| `KSV-0110` | LOW | Workloads in the `default` namespace | The rendered manifests name no namespace. ArgoCD applies them into the dev Environment's own namespace. |
+| `KSV-0125` | MEDIUM | Image from an untrusted registry | `ghcr.io` is not on Trivy's built-in list of trusted registries. It is this repo's own registry. |
 
 ### Supply chain and permissions
 
 - Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
 - The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
-- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate` and in the release `image` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
+- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate` and in the release `image` job, helm and Trivy in `iac-gate`) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
 - gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
 - Each workflow's default token permission is `contents: read` and nothing else. A job that needs more asks for it in its own `permissions:` block. Only the release workflow does, as listed in [Release flow](#release-flow).
 - `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps. The one exception is the release `bump` job, which keeps its deploy key configured for its own push. No other action runs in that job, and checkout's post step removes the key.
@@ -393,7 +425,7 @@ scripts/verify-protection.sh    # check what GitHub actually enforces
 The ruleset applies to `refs/heads/main` and is active:
 
 - **A pull request is required**, with zero approvals, because there is a single maintainer. The checks are the review. The ruleset itself also allows squash merges only.
-- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets` and `image-gate`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
+- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate` and `iac-gate`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
 - **Force-push and deletion of `main` are blocked.**
 - **Only the Bump commit's deploy key can bypass it**, and nobody else, the repo admin included. The bypass list holds one entry, deploy keys in `always` mode, so the pipeline can push the [Bump commit](#bump-commit) without a PR ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)). GitHub's deploy key bypass names no single key: it covers every deploy key of the repo. So `bump-commit` must stay the repo's only deploy key, and `scripts/verify-protection.sh` fails if another one appears. `always` records each bypass in the rule insights, where `exempt` would skip the rules without a trace.
 
@@ -422,4 +454,5 @@ Each security control in the delivery path, where it is enforced, and what it st
 | Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)) | The `read:packages` token reaching the repo. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
+| IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | Dependency updates | Dependabot (`.github/dependabot.yml`): weekly version updates for the app's npm dependencies, the release tooling, the base image and the actions, plus security updates once they are turned on in the repo settings ([Dependabot](#dependabot)) | Pinned versions going stale. Every lockfile entry, the base-image digest and every action SHA is pinned on purpose, so without updates a known vulnerability would stay in place after its fix is published. Dependabot proposes each update as a PR, and the required checks still decide whether it merges. Only an update of the app's production dependencies produces a Release. |
