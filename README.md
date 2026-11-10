@@ -291,7 +291,7 @@ wait   # prints: total=... ok=... non200=... errors=...
 helm uninstall zdt -n zdt-check && kubectl delete namespace zdt-check
 ```
 
-`scripts/request-loop.js` exits 1 if any request was not a 200 and logs each failure with a time stamp on stderr, so ticket 24's rollback demo can reuse it.
+`scripts/request-loop.js` exits 1 if any request was not a 200 and logs each failure with a time stamp on stderr. The [Rollback](#rollback) demo reuses it.
 
 ### Autoscaling under load
 
@@ -703,6 +703,46 @@ scripts/verify-protection.sh
 ```
 
 `test/bump-dev-image-tag.test.js` runs the script against a copy of the dev values in the `test` check. It checks that the diff is exactly the tag line, that a malformed version fails and leaves the file unchanged, and that a file without the tag fails. Local branches need a `git pull` after each Release, because the Bump commit lands in the same history as code commits ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)).
+
+## Rollback
+
+A Deploy is a commit, so rolling one back is a commit too: `git revert` the Bump commit that broke dev, open the revert as a PR, and merge it. ArgoCD sees the old tag in git and deploys it, the same way it deploys any Bump commit. Nobody runs `kubectl rollout undo`: ArgoCD's self-heal would put the broken tag straight back, because git still names it. `argocd app rollback` is refused while automated sync is on. The history keeps both the bad Deploy and its undo.
+
+```bash
+git switch -c chore/revert-bad-deploy origin/main
+git revert <bad Bump commit>             # touches only image.tag in values-dev.yaml
+git push -u origin HEAD
+gh pr create --title "chore: revert the bad Deploy of <version>" --fill
+```
+
+Title the PR `chore: …`. A revert of a `chore(release)` commit is not a code change, and a `chore` title keeps semantic-release from cutting a Release for it. The revert waits for the six required checks like any PR; on the demo's revert the slowest, `image-gate`, took 29 seconds. While it waits, dev keeps serving the old version, as the next part shows.
+
+**What a bad Deploy does.** `maxUnavailable: 0` means an old pod goes only after a new pod is ready (see [Zero-downtime rollouts](#zero-downtime-rollouts)). A new pod that never turns ready therefore never replaces anything: the old pods keep serving and the rollout stalls. After `progressDeadlineSeconds` (3 minutes), the Deployment reports `ProgressDeadlineExceeded` and ArgoCD shows the Application as Degraded. That is the signal to revert.
+
+**Demo on minikube** (2026-11-10, UTC). PR [#35](https://github.com/sela27/sample-nodejs/pull/35) played a bad Bump commit: `scripts/bump-dev-image-tag.sh 9.9.9` pointed dev at a tag that was never pushed. PR [#36](https://github.com/sela27/sample-nodejs/pull/36) is its `git revert`.
+
+| Time | What happened |
+| --- | --- |
+| 19:03:02 | #35 merged. ArgoCD synced it within seconds. |
+| 19:03:13 | The new pod failed with `ErrImagePull` (`manifest unknown`), then `ImagePullBackOff`. The two `1.1.0` pods kept running, ready 2 of 3. |
+| 19:06:14 | `ProgressDeadlineExceeded`, 3 minutes after the new pod was created (a 10-second poll saw it here). ArgoCD: Synced, Degraded. `scripts/smoke-test.sh` through the tunnel passed all five paths. |
+| 19:06:52 | #36 opened: `git revert` of #35's commit. |
+| 19:11:40 | #36 merged. The wait before it was for the Degraded screenshot, not for the checks. |
+| 19:11:52 | ArgoCD: Synced to `f7d6a5b`, Healthy, ready 2 of 2. |
+
+![ArgoCD shows sample-nodejs-dev Degraded: the new ReplicaSet's pod is stuck in ImagePullBackOff while the two old pods keep running](docs/screenshots/24-argocd-degraded-bad-bump.png)
+
+![After the revert ArgoCD shows sample-nodejs-dev Synced and Healthy, with the broken ReplicaSet scaled to zero](docs/screenshots/24-argocd-healthy-after-revert.png)
+
+ArgoCD was Healthy 12 seconds after the merge. No new pod started, and the only pod removed was the broken one, which had never run. The two pods serving before the bad Deploy (`5fcf47f867-gjl84` and `-xx45t`, started at 16:15 UTC) were the same two pods, with no restarts, after the revert. With `maxUnavailable: 0` their ReplicaSet had stayed at two the whole time. Reverting the tag made the Deployment's template match it again, so Kubernetes took it back as the current ReplicaSet and scaled the broken one to zero. Nothing had to pull or start. The smoke test passed again afterwards.
+
+**Request loop.** `scripts/request-loop.js` ran through the tunnel for 25 minutes at 5 requests a second, from before the bad merge until 15 minutes after the revert:
+
+```text
+total=7381 ok=7348 non200=0 errors=33
+```
+
+Every response was a 200, including those during the Degraded window. The 33 errors are three bursts of exactly 11 timeouts each, at 19:08:33, 19:18:27 and 19:21:49. In each burst, about two seconds' worth of consecutive requests got no answer within the 5-second limit. The bursts do not line up with the rollout. The first came two minutes after Degraded, while nothing was changing. The other two came 7 and 10 minutes after the revert, while the Application sat Healthy. During all three, the cluster recorded no event, no pod or Traefik restart, and no HPA scaling. So the stall was on the workstation's side of the tunnel: either in `minikube tunnel` or in the `nip.io` name lookup that each new connection makes. The loop still exits 1 for these timeouts, and the numbers above are as it printed them.
 
 ## Branch protection
 
