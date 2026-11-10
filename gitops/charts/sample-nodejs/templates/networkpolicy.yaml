@@ -1,0 +1,32 @@
+{{- $controller := .Values.networkPolicy.ingressController -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sample-nodejs.fullname" . }}
+  labels:
+    {{- include "sample-nodejs.labels" . | nindent 4 }}
+spec:
+  # The app's pods: the same labels the Service selects.
+  podSelector:
+    matchLabels:
+      {{- include "sample-nodejs.selectorLabels" . | nindent 6 }}
+  # Only incoming traffic is restricted. Egress stays open.
+  policyTypes:
+    - Ingress
+  ingress:
+    # The Ingress controller's pods, in its namespace. Both selectors sit in
+    # one peer, so a pod must match both. As two peers they would admit any
+    # pod in that namespace, or any pod with the controller's labels in the
+    # app's own namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.ingressController.namespace must be set" $controller.namespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- required "networkPolicy.ingressController.podLabels must be set" $controller.podLabels | toYaml | nindent 14 }}
+      ports:
+        # The container port, by name, so it follows config.port. A
+        # NetworkPolicy sees the pod's port, not the Service's port 80.
+        - port: http
+          protocol: TCP
