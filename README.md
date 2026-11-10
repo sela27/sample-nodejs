@@ -188,7 +188,8 @@ gitops/charts/sample-nodejs/
     ├── pdb.yaml
     ├── serviceaccount.yaml
     ├── service.yaml
-    └── ingress.yaml
+    ├── ingress.yaml
+    └── networkpolicy.yaml
 ```
 
 What it renders:
@@ -203,6 +204,7 @@ What it renders:
 - **Service.** `ClusterIP`, port 80 to the container's `http` port (8080). Nothing outside the cluster reaches it directly.
 - **Ingress.** `ingressClassName: traefik` and no controller-specific annotations ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)), so the controller can be replaced without a chart change. The host comes from the Environment's values. There is one `Prefix` rule per Public path, `/my-app` and `/about`, and nothing else. `/classified`, `/metrics`, `/ready` and `/live` have no route, so from outside the cluster they get the controller's 404.
 - **Ingress TLS, off by default.** `ingress.tls.enabled: true` gives the Ingress a TLS section for the host, naming the secret `<object name>-tls` (`sample-nodejs-dev-tls` in dev), and one annotation, `cert-manager.io/cluster-issuer`, set from `ingress.tls.clusterIssuer`. cert-manager sees the annotation, has that ClusterIssuer sign a certificate for the host, and keeps it in the secret, where Traefik picks it up. The annotation is read by cert-manager, not by the Ingress controller, so the Ingress still has no controller-specific annotations. With the flag on and no issuer set, the chart refuses to render. See [HTTPS: Let's Encrypt in production, self-signed here](#https-lets-encrypt-in-production-self-signed-here).
+- **NetworkPolicy.** It selects the app's pods and admits traffic only on the container port (`http`, 8080), and only from Traefik's pods (`app.kubernetes.io/name: traefik`) in the `traefik` namespace, matched by the `kubernetes.io/metadata.name` label that Kubernetes sets on every namespace. Both selectors sit in one peer, so a pod must match both; as two peers they would admit any pod in the `traefik` namespace, or any pod with Traefik's labels in the app's namespace. Every other pod in the cluster, in any namespace including the app's own, cannot open a connection to the app, so `/classified` and `/metrics` stay out of its reach. The policy names the container port, not the Service's port 80, because it sees traffic after the Service has forwarded it to the pod. Egress is not restricted. The controller's namespace and pod labels come from `networkPolicy.ingressController` in the values. A NetworkPolicy is only enforced by a CNI plugin that implements it, which is why Bootstrap starts minikube with Calico. See [NetworkPolicy on the cluster](#networkpolicy-on-the-cluster).
 - **Labels.** Every object and every pod carries `app.kubernetes.io/name`, `instance`, `version` (the image tag) and `managed-by`, plus Helm's `helm.sh/chart`. The Deployment selector uses only `name` and `instance`, which never change for a release, because a selector cannot be changed after creation.
 
 ### Why a Deployment, not a StatefulSet
@@ -238,7 +240,7 @@ The two original pods kept the load (242m and 142m at the end) while the three n
 
 ### Values and Environments
 
-- `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the HPA (`autoscaling`) and the PodDisruptionBudget (`podDisruptionBudget`), the name of the registry pull secret, the Ingress class, the list of Public paths and the Ingress TLS flag, off. An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
+- `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the HPA (`autoscaling`) and the PodDisruptionBudget (`podDisruptionBudget`), the name of the registry pull secret, the Ingress class, the list of Public paths, the Ingress TLS flag, off, and the Ingress controller that the NetworkPolicy admits (namespace `traefik`, pods labeled `app.kubernetes.io/name: traefik`). An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
 - `values-dev.yaml` holds what the dev Environment adds: the image repository `ghcr.io/sela27/sample-nodejs`, the image tag, and the host `sample-nodejs.127.0.0.1.nip.io`. nip.io resolves that name to 127.0.0.1, where `minikube tunnel` exposes Traefik, so no hosts-file edit is needed.
 - The chart refuses to render without an image repository, an image tag, a host and a pull secret name, or with Ingress TLS on and no ClusterIssuer, so a missing value fails at render time, not in the cluster.
 - The dev image tag is a Release version, `1.0.0` at first, seeded by hand. From then on the [Bump commit](#bump-commit) is the only writer of `image.tag` in `values-dev.yaml`, and it always writes a Release version. No manifest uses `latest`.
@@ -261,9 +263,9 @@ So the local setup would use a self-signed ClusterIssuer: cert-manager signs the
 1. `helm lint --strict` with the dev values, and again with Ingress TLS on. Warnings fail too.
 2. `helm template` with the dev values, and again with Ingress TLS on (`ingress.tls.enabled=true` and a test ClusterIssuer name). A third render, with TLS on and no issuer, must fail.
 3. kubeconform in strict mode, over both renders, against the schemas of Kubernetes 1.35.1, the version Bootstrap runs. Strict mode also rejects unknown fields, such as a misspelled `containerPorts`, and duplicate keys, which Kubernetes would otherwise drop without a word.
-4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik`, no annotations, no TLS section and the dev host; the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
+4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik`, no annotations, no TLS section and the dev host; the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; one NetworkPolicy selects the app's pods, restricts ingress only, admits one TCP port, the container port, and admits exactly one peer, Traefik's pods in the namespace that `gitops/apps/traefik.yaml` deploys Traefik into; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
 5. Assertions on the TLS-on render: the Ingress has one TLS entry, for the dev host, that names a secret; its only annotation is `cert-manager.io/cluster-issuer`, set to the issuer the check passed in; and with those two taken out, the render is the same as the default one, object for object, so the flag changes nothing else.
-6. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes and the Service's target together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
+6. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes, the Service's target and the NetworkPolicy's port together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
 
 Each failure prints what was expected and what the chart rendered. If the dev values added `/classified` to the Public paths, for example, the check fails with `expected: /about /my-app | got: /about /classified /my-app`.
 
@@ -603,9 +605,53 @@ Each security control in the delivery path, where it is enforced, and what it st
 | `RuntimeDefault` seccomp profile | Pod `seccompProfile` | System calls outside the container runtime's default allowlist, which shrinks the kernel surface an exploit can reach. |
 | No Kubernetes API token | ServiceAccount and pod `automountServiceAccountToken: false` | A compromised pod using an API token to read or change cluster objects. |
 | Restricted Pod Security admission | Labels `pod-security.kubernetes.io/enforce`, `audit` and `warn` set to `restricted` on the `sample-nodejs-dev` namespace by Bootstrap | Any pod in the app namespace that breaks the restricted profile, whatever its chart says: the API server refuses to create it. |
+| NetworkPolicy | The chart's NetworkPolicy, enforced by Calico, the CNI that Bootstrap starts minikube with. A CNI without NetworkPolicy support accepts the object and ignores it, so the control holds only on a cluster that enforces it | Any pod other than Traefik's, in any namespace, the app's own included, opening a connection to the app, and so reaching the internal paths `/classified` and `/metrics` that the Ingress does not route. Only Traefik's pods in the `traefik` namespace reach the app port ([NetworkPolicy on the cluster](#networkpolicy-on-the-cluster)). |
 | Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)), which never prints the token | The `read:packages` token reaching the repo or a log. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | Dependency updates | Dependabot (`.github/dependabot.yml`): weekly version updates for the app's npm dependencies, the release tooling, the base image and the actions, plus security updates once they are turned on in the repo settings ([Dependabot](#dependabot)) | Pinned versions going stale. Every lockfile entry, the base-image digest and every action SHA is pinned on purpose, so without updates a known vulnerability would stay in place after its fix is published. Dependabot proposes each update as a PR, and the required checks still decide whether it merges. Only an update of the app's production dependencies produces a Release. |
 | Signed image with build provenance | The release `image` job: a keyless cosign signature and an `actions/attest` SLSA provenance attestation on the pushed digest ([Image signature and provenance](#image-signature-and-provenance)) | An image that this repo's release workflow on `main` did not build passing as a Release: one pushed by hand, swapped behind a tag, or built by a fork or a PR run fails `cosign verify` and `gh attestation verify`. The cluster does not check it yet. |
+
+### NetworkPolicy on the cluster
+
+Recorded on the Bootstrap cluster (minikube with Calico) against a test deployment of the chart from the NetworkPolicy's branch: a temporary ArgoCD Application, `sample-nodejs-t22`, with the dev values, in its own namespace `sample-nodejs-t22` with the restricted Pod Security labels, and the Ingress host `t22.127.0.0.1.nip.io`. The probe pod runs in another namespace, `t22-probe`, and uses the app image, which is already on the node and carries BusyBox `wget`; `-T 5` gives up after 5 seconds.
+
+Before the NetworkPolicy, the probe reads the internal path `/classified`:
+
+```console
+$ kubectl create namespace t22-probe
+$ kubectl -n t22-probe run probe --rm -i --restart=Never \
+    --image=ghcr.io/sela27/sample-nodejs:1.0.0 --image-pull-policy=IfNotPresent --command -- \
+    wget -T 5 -qO- http://sample-nodejs-t22.sample-nodejs-t22.svc/classified
+You should not be here!!!pod "probe" deleted from t22-probe namespace
+```
+
+With the NetworkPolicy synced, the same request times out. Calico drops the packets rather than refusing the connection, so the client waits for its own timeout:
+
+```console
+$ time kubectl -n t22-probe run probe --rm -i --quiet --restart=Never \
+    --image=ghcr.io/sela27/sample-nodejs:1.0.0 --command -- \
+    wget -T 5 -qO- http://sample-nodejs-t22.sample-nodejs-t22.svc/classified
+wget: download timed out
+pod t22-probe/probe terminated (Error)
+
+real    0m7.582s
+```
+
+A probe pod in the app's own namespace, `sample-nodejs-t22`, with the restricted security settings that namespace requires, timed out the same way. The app pod stayed Ready with no restarts, so the kubelet's probes are not affected.
+
+Traefik still reaches the app. Through a port-forward to the Traefik Service, the Public paths answer and the internal paths get Traefik's 404:
+
+```console
+$ kubectl -n traefik port-forward svc/traefik 18022:80 &
+$ for p in /my-app /about /classified /metrics; do
+    printf '%s %s\n' "$p" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: t22.127.0.0.1.nip.io' "http://127.0.0.1:18022$p")"
+  done
+/my-app 200
+/about 200
+/classified 404
+/metrics 404
+```
+
+The test Application and both namespaces were deleted afterwards. `dev` gets the NetworkPolicy when the change merges, through ArgoCD like any chart change.
