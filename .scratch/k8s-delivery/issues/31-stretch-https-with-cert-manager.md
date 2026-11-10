@@ -10,10 +10,10 @@
 
 **Human step:** screenshot of the app over HTTPS.
 
-- [ ] cert-manager is installed as an ArgoCD child Application at a pinned version, together with a self-signed ClusterIssuer. The manifests are in this PR (chart v1.21.3, and the issuer as its own Application with a retry policy); that ArgoCD syncs both is verified after the merge, because ArgoCD tracks `main`.
-- [ ] The TLS flag is on in the `dev` values (done and checked by `check-chart.sh` in this PR; the issued certificate and the HTTPS answer are verified after the merge). A certificate is issued and `https://sample-nodejs.127.0.0.1.nip.io/my-app` serves the app, with the expected self-signed browser warning.
-- [x] The smoke test accepts an HTTPS base URL. Checked before the merge against stubbed curl and kubectl (`test/smoke-test.test.js`); a run against the real certificate is verified after the merge.
+- [x] cert-manager is installed as an ArgoCD child Application at a pinned version (chart v1.21.3), together with a self-signed ClusterIssuer (its own Application, with a retry policy). Verified on the cluster after the merge on 2026-11-10: both Applications Synced and Healthy, `selfsigned-issuer` Ready.
+- [x] The TLS flag is on in the `dev` values. A certificate is issued (Ready) and `https://sample-nodejs.127.0.0.1.nip.io/my-app` serves the app, with the expected self-signed browser warning. Verified after the merge with `curl` against the secret's CA through the tunnel; the browser screenshot is the human step and is still to do.
+- [x] The smoke test accepts an HTTPS base URL. Checked before the merge against stubbed curl and kubectl (`test/smoke-test.test.js`), and after it against the real certificate: it passes with the CA verified through the tunnel and with `--port-forward --https`.
 - [x] The README documents this.
 - [x] PR title is `chore(cluster): …`. Status set to `done` in the same PR.
 
-**Verified after the merge** (ArgoCD tracks `main`): ArgoCD syncs cert-manager and the issuer on the live cluster; the Certificate becomes Ready; `https://sample-nodejs.127.0.0.1.nip.io/my-app` serves the app with that certificate; `scripts/smoke-test.sh --port-forward --https` passes against it. A follow-up PR ticks the criteria that depend on this and records the cluster's memory after the install.
+**Verified after the merge** (2026-11-10): ArgoCD synced both Applications; the Certificate is Ready and `ca.crt` is filled; the smoke test passes over HTTPS (tunnel and `--port-forward --https`) and over HTTP (tunnel and `--port-forward`); `verify-bootstrap.sh` passes. Cluster memory went from about 2.6 GiB to 2.89 GiB of 4 GiB (README, "HTTPS"). Still open: the screenshot of the app over HTTPS, a human step.
