@@ -22,6 +22,13 @@ plugins:
   # comment on the released PRs or open an issue when a release fails, which
   # would need the issues and pull-requests write permissions; the job token
   # gets contents: write only.
+  #
+  # The one asset is the CycloneDX SBOM of the released image,
+  # sample-nodejs-<version>.cdx.json, which the release job downloads from the
+  # image job into sbom/. The plugin only warns when the file is missing, so
+  # the release job checks afterwards that the Release carries it.
   - - "@semantic-release/github"
     - successCommentCondition: false
       failCommentCondition: false
+      assets:
+        - path: sbom/sample-nodejs-*.cdx.json

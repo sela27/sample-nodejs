@@ -7,17 +7,17 @@
 #   version  semantic-release dry run: the next version, or none. With none,
 #            the run ends here, green.
 #   image    BuildKit build tagged <version> and sha-<short>, the image Gate,
-#            then the push to GHCR. A Gate failure stops the job before it
-#            logs in to the registry.
+#            then the push to GHCR, then the CycloneDX SBOM of the pushed
+#            image, read from GHCR by digest. A Gate failure stops the job
+#            before it logs in to the registry.
 #   release  semantic-release for real: the v<version> tag and the GitHub
-#            Release. It runs only after the image is in GHCR, so no tag and
-#            no Release ever exist without their image.
+#            Release, with the SBOM attached. It runs only after the image is
+#            in GHCR, so no tag and no Release ever exist without their image.
 #   bump     the Bump commit: sets the dev image tag in the chart's dev values
 #            to <version> and pushes that one-line change to main with the
 #            deploy key. ArgoCD deploys it from there.
 #
-# Signing and provenance belong after the push, and the SBOM before the GitHub
-# Release.
+# Signing and provenance belong after the push, before the SBOM.
 #
 # The Bump commit carries [skip ci] in its message. GitHub starts no workflow
 # for a push whose head commit says that, this one included.
@@ -152,16 +152,57 @@ jobs:
           docker push "${IMAGE}:${VERSION}"
           docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
           echo "Pushed \`${IMAGE}:${VERSION}\` and \`${IMAGE}:sha-${GITHUB_SHA::7}\`." >> "$GITHUB_STEP_SUMMARY"
+      # Read back from GHCR, not from the local engine: the digest the
+      # registry now serves for the version tag.
+      - name: Read the digest of the pushed image from GHCR
+        id: pushed
+        run: |
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the digest of ${IMAGE}:${VERSION} from the registry, got '${digest}'."
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Digest: \`${IMAGE}@${digest}\`." >> "$GITHUB_STEP_SUMMARY"
+      # The same pinned Trivy, reading the image from GHCR by digest
+      # (--image-src remote, with the login above), so the SBOM lists exactly
+      # what the registry serves. The jq check fails the job on an empty SBOM
+      # or one about another image.
+      - name: Generate the CycloneDX SBOM of the pushed image
+        id: sbom
+        env:
+          DIGEST: ${{ steps.pushed.outputs.digest }}
+        run: |
+          mkdir -p sbom
+          sbom="sbom/sample-nodejs-${VERSION}.cdx.json"
+          trivy image \
+            --image-src remote \
+            --format cyclonedx \
+            --output "${sbom}" \
+            "${IMAGE}@${DIGEST}"
+          jq -e --arg ref "${IMAGE}@${DIGEST}" '
+            .bomFormat == "CycloneDX"
+            and (.components | length > 0)
+            and any(.metadata.component.properties[]?; .name == "aquasecurity:trivy:RepoDigest" and .value == $ref)
+          ' "${sbom}" > /dev/null
+          echo "SBOM \`$(basename "${sbom}")\`: CycloneDX $(jq -r .specVersion "${sbom}"), $(jq '.components | length' "${sbom}") components." >> "$GITHUB_STEP_SUMMARY"
+      # Handed to the release job, which attaches it to the GitHub Release.
+      - name: Hand the SBOM to the release job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom/sample-nodejs-${{ env.VERSION }}.cdx.json
+          if-no-files-found: error
 
   # semantic-release for real, with .releaserc.yaml: it tags this commit
-  # v<version> and creates the GitHub Release with the notes. No npm publish,
-  # and no commit back to the repo.
+  # v<version> and creates the GitHub Release with the notes and the SBOM from
+  # the image job as an asset. No npm publish, and no commit back to the repo.
   release:
     needs: [version, image]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      # Push the tag and create the GitHub Release.
+      # Push the tag, create the GitHub Release and upload the SBOM to it.
       contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -177,6 +218,12 @@ jobs:
       - name: Install the pinned release tooling
         working-directory: release
         run: npm ci --ignore-scripts --no-audit --no-fund
+      # Into sbom/, where the assets entry in .releaserc.yaml looks for it.
+      - name: Get the SBOM from the image job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: sbom
       - name: Create the tag and the GitHub Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -191,6 +238,25 @@ jobs:
             exit 1
           fi
           echo "Released \`v${VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
+      # semantic-release only logs a warning for an asset file it cannot read,
+      # and still creates the Release. The run must not look green then, so
+      # this downloads the asset back and compares it with the SBOM above.
+      - name: Check that the Release carries the SBOM
+        id: released-sbom
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sbom="sample-nodejs-${VERSION}.cdx.json"
+          if ! gh release download "v${VERSION}" --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${sbom}" --dir "${RUNNER_TEMP}/released"; then
+            echo "::error::The Release v${VERSION} has no asset ${sbom}. The semantic-release log above says why."
+            exit 1
+          fi
+          if ! cmp -s "sbom/${sbom}" "${RUNNER_TEMP}/released/${sbom}"; then
+            echo "::error::The asset ${sbom} on the Release v${VERSION} differs from the SBOM the image job generated."
+            exit 1
+          fi
+          echo "Attached the SBOM \`${sbom}\` to \`v${VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
 
   # The Bump commit points the dev Environment at the image just released. It
   # changes only image.tag in the chart's dev values
