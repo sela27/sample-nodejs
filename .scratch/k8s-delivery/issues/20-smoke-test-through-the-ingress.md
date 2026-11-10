@@ -13,7 +13,7 @@
 - [x] A bash script with an overridable host checks: 200 and the expected body from `/my-app`, 200 from `/about`, and 404 from `/classified`, `/metrics` and `/ready`.
 - [x] It prints PASS or FAIL per path and exits non-zero on any failure.
 - [x] It passes against `dev`.
-- [ ] Both screenshots are saved.
+- [x] Both screenshots are saved. (2026-11-10, after `scripts/smoke-test.sh` passed all five paths through the tunnel: `docs/screenshots/20-classified-404-in-browser.png` and `docs/screenshots/20-argocd-app-tree-synced-healthy.png`. The browser's bookmarks bar was cut out of the copies.)
 - [x] The README gains a "Verifying a Deploy" section.
 - [x] PR title is `test: …`. Status set to `done` in the same PR.
 
