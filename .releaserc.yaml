@@ -1,0 +1,27 @@
+# semantic-release configuration, used by .github/workflows/release.yml.
+#
+# The git tag is the source of truth for the version, so nothing is written
+# back to the repo: there is no @semantic-release/git plugin, package.json
+# keeps its placeholder version, and no CHANGELOG file is committed. The
+# release notes live in the GitHub Release. There is no @semantic-release/npm
+# plugin either: the app ships as a container image, never to the npm
+# registry.
+branches:
+  - main
+tagFormat: v${version}
+plugins:
+  # Conventional Commits decide the version, with the analyzer's default
+  # rules: feat is a minor; fix, perf and a revert are a patch; a breaking
+  # change is a major. ci, docs, chore, build, test, refactor and style
+  # produce no Release. The first Release is 1.0.0.
+  - - "@semantic-release/commit-analyzer"
+    - preset: conventionalcommits
+  - - "@semantic-release/release-notes-generator"
+    - preset: conventionalcommits
+  # Creates the GitHub Release for the tag, with the notes above. It does not
+  # comment on the released PRs or open an issue when a release fails, which
+  # would need the issues and pull-requests write permissions; the job token
+  # gets contents: write only.
+  - - "@semantic-release/github"
+    - successCommentCondition: false
+      failCommentCondition: false
