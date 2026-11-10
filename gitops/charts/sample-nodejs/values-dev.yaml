@@ -2,10 +2,10 @@
 
 image:
   repository: ghcr.io/sela27/sample-nodejs
-  # Placeholder until the first Release exists: no image carries this tag yet.
-  # From the first Release on, the Bump commit is the only writer of this line,
-  # and it always sets a Release version (never `latest`).
-  tag: 0.0.0-placeholder
+  # The Release that dev runs. The Bump commit (scripts/bump-dev-image-tag.sh)
+  # is the only writer of this line, and it always sets a Release version,
+  # never `latest`. Seeded by hand to 1.0.0, the first Release.
+  tag: 1.0.0
 
 ingress:
   # nip.io resolves this name to 127.0.0.1, where `minikube tunnel` exposes
