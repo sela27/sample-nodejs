@@ -120,7 +120,7 @@ On SIGTERM, which Kubernetes and `docker stop` send, or SIGINT (Ctrl+C), `node a
 2. Lets requests already in flight finish. It answers them with `Connection: close`, so a keep-alive client such as the ingress controller's connection pool cannot hold the shutdown open.
 3. Exits 0 once the server has closed.
 
-If connections are still open after `SHUTDOWN_TIMEOUT_MS` milliseconds (default `10000`), the app logs that on stderr and exits 1. The kubelet sends SIGKILL when the pod's termination grace period runs out, so the timeout must stay shorter than that grace period minus any preStop pause. The chart keeps the Kubernetes default grace period of 30 seconds.
+If connections are still open after `SHUTDOWN_TIMEOUT_MS` milliseconds (default `10000`), the app logs that on stderr and exits 1. The kubelet sends SIGKILL when the pod's termination grace period runs out, so the timeout must stay shorter than that grace period minus any preStop pause. The chart sets the grace period to 30 seconds and pauses 5 seconds in a preStop hook, which leaves the app 25 seconds, 15 more than its default timeout. See [Zero-downtime rollouts](#zero-downtime-rollouts).
 
 Before this, the container ignored SIGTERM altogether. Node runs as PID 1 in the container, and the kernel does not apply a signal's default action to PID 1, so a process without a handler never ends on SIGTERM. `docker stop` waited out its timeout and then killed it. Timed with `docker stop -t 10` on the hardened container from [Container image](#container-image) (Docker Desktop 29.6.1, 2026-11-10):
 
@@ -200,6 +200,7 @@ What it renders:
 - **Rollout on a config change.** A container reads its environment variables only when it starts, so a changed ConfigMap alone would leave the running pods on the old values. The pod template carries a `checksum/config` annotation, the SHA-256 of the ConfigMap's data. A config change changes the checksum, and with it the pod template, so the Deployment rolls the pods. A change that leaves the ConfigMap as it is keeps the checksum and causes no rollout of its own.
 - **Pod hardening.** The pods meet the [restricted Pod Security profile](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted): `runAsNonRoot`, uid and gid 1000 (the image's `node` user), the `RuntimeDefault` seccomp profile, `allowPrivilegeEscalation: false` and every capability dropped. The root filesystem is read-only as well. The app writes nothing to disk, so it gets no writable volume, not even `/tmp`. These settings are written in the Deployment template, not taken from values, so no Environment's values file can loosen them.
 - **HorizontalPodAutoscaler.** An `autoscaling/v2` HPA keeps the Deployment between 2 and 5 replicas, aiming at 70% average CPU use. All three numbers come from `autoscaling` in the values. Utilization is a share of the CPU request, so the 50m request makes the target 35m per pod. metrics-server, which Bootstrap enables, supplies the readings. While the HPA is on (`autoscaling.enabled`, the default), the Deployment leaves `replicas` out, so the HPA owns the count. If the Deployment set it, every ArgoCD sync would put the count from git back over the one the HPA chose. With the HPA off, `replicaCount` (2) sets the replicas.
+- **Rollout settings.** A `RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1`, a 5-second native `sleep` preStop hook, `terminationGracePeriodSeconds: 30` and `progressDeadlineSeconds: 180`. They are written in the Deployment template, not taken from values. See [Zero-downtime rollouts](#zero-downtime-rollouts).
 - **PodDisruptionBudget.** `minAvailable: 1` over the app's pods, from `podDisruptionBudget` in the values. A voluntary disruption, such as `kubectl drain`, can evict an app pod only while another one stays ready, so the app keeps serving through it. It does not cover a node or a pod crashing, only evictions. `minAvailable` stays below the fewest pods the Deployment runs (2), or no pod could ever be evicted and a drain would wait forever.
 - **ServiceAccount.** The pods run under their own ServiceAccount, with `automountServiceAccountToken: false` on both the ServiceAccount and the pod, because the app never calls the Kubernetes API. The ServiceAccount carries the registry pull secret for the private image as its `imagePullSecrets` entry. The chart only names the secret (`image.pullSecret`, default `ghcr-pull`); Bootstrap creates it in the app namespace ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)).
 - **Service.** `ClusterIP`, port 80 to the container's `http` port (8080). Nothing outside the cluster reaches it directly.
@@ -214,6 +215,59 @@ What it renders:
 The app keeps no data on disk, has no database, and needs no per-pod identity. Any pod can serve any request, and pods can be replaced in any order. The one piece of in-memory state, the `root_access_total` counter, is per pod by design: each pod reports its own count and Prometheus sums them, so losing a pod's count when the pod is replaced is expected, not data loss.
 
 A StatefulSet gives stable pod names, ordered start and stop, and a PersistentVolumeClaim per pod. The app uses none of these, and the ordered, one-at-a-time rollout would only make every Deploy slower. A StatefulSet is the right choice for a database, a message broker, or anything that needs a stable network identity or its own volume.
+
+### Zero-downtime rollouts
+
+A rollout must never lower the number of ready pods and never cut a request short. The Deployment says so in five settings:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `strategy.rollingUpdate.maxUnavailable` | `0` | An old pod goes only after a new one is ready. |
+| `strategy.rollingUpdate.maxSurge` | `1` | One extra pod at a time. |
+| `lifecycle.preStop.sleep.seconds` | `5` | Kubernetes removes a terminating pod from the Service's endpoints and starts stopping it at the same moment, but Traefik hears of the removal a moment later. The pause keeps the app serving until Traefik has dropped it. The native `sleep` action (Kubernetes 1.30+) needs no shell in the image. |
+| `terminationGracePeriodSeconds` | `30` | The grace period starts before the preStop hook, so it must cover the 5 s pause plus the app's shutdown timeout (`SHUTDOWN_TIMEOUT_MS`, 10 s). 30 s leaves 15 s to spare. |
+| `progressDeadlineSeconds` | `180` | A rollout that makes no progress for 3 minutes, such as a new pod that never turns ready, is marked failed and ArgoCD shows the Deployment as Degraded, instead of after the default 10 minutes. An image pull plus the startup probe (30 s at most) fits well inside it. |
+
+The old pods keep serving during the whole rollout, so a stuck rollout leaves the old version running.
+
+**Checked on minikube** (2026-11-10), before merge, in a throwaway namespace, with the dev values (image tag `1.1.0`) under another Ingress host. `scripts/request-loop.js` sent 20 requests a second to `/my-app` through Traefik, each on a new connection, and counted every non-200 response and every connection error or timeout (5 s limit), while `kubectl rollout restart` ran four times in a row. The same test ran against the chart from `main` before this change:
+
+| Chart | Rollouts | Requests | Non-200 | Errors | Each rollout took |
+| --- | --- | --- | --- | --- | --- |
+| `main`, before | 4 | 2,925 | 7 (HTTP 502) | 67 (timeouts) | 6 s |
+| This branch | 4 | 2,922 | 0 | 0 | 6 s |
+
+With the default strategy (25% unavailable, 25% surge) and no preStop pause, every rollout produced a burst of 502s and timeouts, as Traefik kept sending requests to a pod that had stopped listening. With the new settings the loop saw no failure in 2,922 requests.
+
+To repeat it:
+
+```bash
+# 1. Install the chart in a throwaway namespace, under its own host.
+kubectl create namespace zdt-check
+helm install zdt gitops/charts/sample-nodejs -n zdt-check \
+  -f gitops/charts/sample-nodejs/values-dev.yaml --set ingress.host=zdt.example.test
+kubectl -n zdt-check rollout status deploy/zdt-sample-nodejs   # then wait until the HPA has made it two pods
+
+# 2. Reach Traefik from the workstation.
+kubectl -n traefik port-forward svc/traefik 18080:80 &
+
+# 3. Start the loop; it prints one summary line when its duration ends.
+node scripts/request-loop.js --url http://127.0.0.1:18080/my-app \
+  --host zdt.example.test --rps 20 --duration 180 &
+
+# 4. Roll the Deployment four times meanwhile.
+for i in 1 2 3 4; do
+  kubectl -n zdt-check rollout restart deploy/zdt-sample-nodejs
+  kubectl -n zdt-check rollout status deploy/zdt-sample-nodejs
+  sleep 5
+done
+wait   # prints: total=... ok=... non200=... errors=...
+
+# 5. Clean up.
+helm uninstall zdt -n zdt-check && kubectl delete namespace zdt-check
+```
+
+`scripts/request-loop.js` exits 1 if any request was not a 200 and logs each failure with a time stamp on stderr, so ticket 24's rollback demo can reuse it.
 
 ### Autoscaling under load
 
@@ -287,7 +341,7 @@ The NetworkPolicy admits every pod in the monitoring namespace, matched by the `
 1. `helm lint --strict` with the dev values, and again with Ingress TLS on. Warnings fail too.
 2. `helm template` with the dev values, and again with Ingress TLS on (`ingress.tls.enabled=true` and a test ClusterIssuer name). A third render, with TLS on and no issuer, must fail.
 3. kubeconform in strict mode, over the three renders (default, TLS on, ServiceMonitor on), against the schemas of Kubernetes 1.35.1, the version Bootstrap runs. Strict mode also rejects unknown fields, such as a misspelled `containerPorts`, and duplicate keys, which Kubernetes would otherwise drop without a word.
-4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik`, no annotations, no TLS section and the dev host; the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; one NetworkPolicy selects the app's pods, restricts ingress only, admits one TCP port, the container port, and admits exactly one peer, Traefik's pods in the namespace that `gitops/apps/traefik.yaml` deploys Traefik into; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
+4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik`, no annotations, no TLS section and the dev host; the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; one NetworkPolicy selects the app's pods, restricts ingress only, admits one TCP port, the container port, and admits exactly one peer, Traefik's pods in the namespace that `gitops/apps/traefik.yaml` deploys Traefik into; the Deployment rolls with `maxUnavailable: 0` and `maxSurge: 1`, pauses in a native `sleep` preStop hook, has a termination grace period longer than that pause plus the app's 10-second shutdown timeout, and a progress deadline of at most 300 seconds; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
 5. Assertions on the TLS-on render: the Ingress has one TLS entry, for the dev host, that names a secret; its only annotation is `cert-manager.io/cluster-issuer`, set to the issuer the check passed in; and with those two taken out, the render is the same as the default one, object for object, so the flag changes nothing else.
 6. Assertions on the ServiceMonitor-on render, with a scrape interval, a label and a namespace that differ from the defaults, so the values show up in the objects: one `monitoring.coreos.com/v1` ServiceMonitor with one endpoint, path `/metrics`, on the Service's port name, with that interval and label, selecting the Service by its labels and pinning the release; the NetworkPolicy has two peers, Traefik's first and unchanged, then the monitoring namespace, on the one container port; and with the ServiceMonitor and that peer taken out, the render is the default one, object for object. The default render has no ServiceMonitor and one peer. The default values give `30s` and the `monitoring` namespace.
 7. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes, the Service's target and the NetworkPolicy's port together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
