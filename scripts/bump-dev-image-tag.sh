@@ -9,8 +9,9 @@
 # The version is the Release version without the `v`, for example 1.2.3, as
 # the image is tagged in GHCR.
 #
-# The file is rewritten in place only after the edit succeeded. If the tag
-# already is the version, the file is left as it is and the script says so.
+# The file is rewritten in place only after the edit succeeded; on any failure
+# it is left as it was. Setting the version the tag already has leaves the file
+# byte-identical, so there is nothing to commit.
 #
 # Runs from Git Bash on Windows and natively on Linux and macOS. Needs only
 # bash and awk.
