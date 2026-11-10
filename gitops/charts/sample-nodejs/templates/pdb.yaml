@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sample-nodejs.fullname" . }}
+  labels:
+    {{- include "sample-nodejs.labels" . | nindent 4 }}
+spec:
+  # A voluntary disruption, such as a node drain, may evict an app pod only if
+  # at least this many app pods stay ready after it.
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "sample-nodejs.selectorLabels" . | nindent 6 }}
