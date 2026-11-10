@@ -81,7 +81,7 @@ The `Dockerfile` has two stages on the same base image:
 - The **build stage** runs `npm ci --omit=dev --ignore-scripts`. It installs production dependencies only, exactly as `package-lock.json` pins them, and runs no install scripts.
 - The **runtime stage** copies in only `app.js`, `package.json` and the production `node_modules`. It deletes npm, npx, corepack and yarn, sets `NODE_ENV=production`, runs as the image's built-in `node` user and exposes port 8080. The user is given by number, `USER 1000:1000`, so a runtime can check that it is not root from the image alone, without reading the image's `/etc/passwd`. The app files stay owned by root, so the app process cannot rewrite its own code.
 
-The base image is pinned by its multi-arch digest, with the tag in a comment, so every build starts from the same bytes. Picking up base-image patches means bumping the digest.
+The base image is pinned by its multi-arch digest, with the tag in a comment, so every build starts from the same bytes. Picking up base-image patches means bumping the digest, which [Dependabot](#dependabot) proposes every week.
 
 `.dockerignore` is an allowlist. Only `app.js`, `package.json` and `package-lock.json` enter the build context. Tests, git metadata, docs, the tracker directory, CI and agent tooling, a local `node_modules` and any stray `.env` never reach the builder. A new source file has to be added there and to the `COPY` line.
 
@@ -283,6 +283,40 @@ KSV-0014 (HIGH): Container 'app' of Deployment 'sample-nodejs-dev' should set 's
 - `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
 - A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
 
+### Dependabot
+
+`.github/dependabot.yml` has Dependabot look for version updates once a week, on Monday, wherever this repo pins a dependency. Its PRs are ordinary PRs to `main`: they run every required check and merge only when all of them pass, so an update that breaks a test, the chart or the image Gate cannot land.
+
+| What it updates | Directory | PRs | Title prefix | Release on merge |
+| --- | --- | --- | --- | --- |
+| The app's production npm dependencies (`dependencies` in `package.json`, and the packages below them in `package-lock.json`) | `/` | minor and patch updates together in the `production` group; each major in its own PR, except Express, which stays on 4 | `fix(deps)` | patch |
+| The app's dev npm dependencies (`devDependencies`) | `/` | all together in the `development` group | `chore(deps)` | none |
+| The release tooling (`release/package.json` and `release/package-lock.json`) | `/release` | minor and patch updates together in the `release-tooling` group | `ci(deps)` | none |
+| The base image (`FROM node:24-alpine@sha256:…` in the `Dockerfile`) | `/` | one PR with the new digest, staying on Node 24 | `chore(deps)` | none |
+| The actions in `.github/workflows/*.yml` | `/` | all together in the `actions` group | `ci(deps)` | none |
+
+- **The prefix decides the Release.** The squash commit on `main` is the PR title, and Dependabot starts its titles with the configured prefix and a colon, as in `fix(deps): bump the production group with 2 updates`, `fix(deps): bump express from 4.22.3 to 4.22.4 in the production group` or `ci(deps): bump the actions group with 2 updates`. A security update adds `[security]` after the prefix, as in `fix(deps): [security] bump …`, which the commit analyzer still reads by its type. Only the app's production dependencies, the code the image runs, use the releasing `fix`. No entry sets `include: scope`, which would append a second scope to the prefix, as in `fix(deps)(deps)`.
+- **One dependency type per group.** A grouped PR takes the production prefix as soon as one production dependency is in it, so a mixed group would release dev-only changes. The app's two groups are therefore split by dependency type.
+- **A base-image update does not release by itself.** It merges as `chore(deps)`, so the patched base reaches GHCR with the next `fix` or `feat`. To ship a base-image security fix at once, retitle the Dependabot PR to `fix(deps): …` before merging it.
+- **Version comments stay in step.** Dependabot moves an action's SHA and its trailing version comment together. GitHub's docs say "Dependabot updates the version documentation of GitHub Actions when the comment is on the same line" ([supported ecosystems](https://docs.github.com/en/code-security/dependabot/ecosystems-supported-by-dependabot/supported-ecosystems-and-repositories#github-actions)), which is how every action here is pinned.
+- **Majors held back.** Major updates of Express (the spec keeps Express 4), of the base image (Node 24 is the chosen LTS line, see [Why `node:24-alpine`](#why-node24-alpine)) and of the release tooling are ignored. The release tooling's majors are a manual step: the preset's majors follow the release notes writer that semantic-release bundles (see "Pinned release tooling" in [Release flow](#release-flow)), and no PR check runs the release tooling, so a broken update would first show as a red `version` job on `main`. These rules hold back version updates only. Dependabot drops `update-types` ignore rules when it looks for a security fix ([`ignore_condition.rb`](https://github.com/dependabot/dependabot-core/blob/main/common/lib/dependabot/config/ignore_condition.rb)).
+- **Security updates** are a repo setting, separate from the file. When an advisory affects a locked version, Dependabot opens a fix PR without waiting for the schedule, with the same prefixes as the matching entry above. They need Dependabot alerts, and both are turned on by a repo admin:
+
+  ```bash
+  gh api -X PUT repos/sela27/sample-nodejs/vulnerability-alerts
+  gh api -X PUT repos/sela27/sample-nodejs/automated-security-fixes
+  ```
+
+- **Secrets.** A workflow run that Dependabot triggers gets a read-only token and only the repo's Dependabot secrets, never its Actions secrets. The current checks need none. A check that does needs its secret added under both, which is why `SONAR_TOKEN` also goes in as a Dependabot secret when the SAST Gate arrives.
+- **Not covered.** Dependabot does not read the versions pinned with a SHA-256 in the workflows (helm, kubeconform, yq, gitleaks, Trivy), the Traefik and ArgoCD chart versions, or the tool versions in the README. Those are bumped by hand.
+
+`scripts/check-dependabot.sh` validates the file before it lands, because GitHub reads it only from `main` and a mistake would show up as update PRs that never arrive. It checks the file against the Dependabot configuration schema with check-jsonschema 0.39.0, then against the policy above: the four entries, the weekly schedule, the prefix of each entry, no `include: scope`, and one dependency type per group of the app's updates. It needs [uv](https://docs.astral.sh/uv/) on PATH and prints PASS or FAIL per check:
+
+```bash
+scripts/check-dependabot.sh                    # checks .github/dependabot.yml
+scripts/check-dependabot.sh path/to/other.yml  # or another file
+```
+
 ## Release flow
 
 A squash merge into `main` becomes one commit, and its message is the PR title, a Conventional Commit. That commit type alone decides whether the merge produces a Release. `.github/workflows/release.yml` runs on every push to `main` and never on a pull request.
@@ -421,3 +455,4 @@ Each security control in the delivery path, where it is enforced, and what it st
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
+| Dependency updates | Dependabot (`.github/dependabot.yml`): weekly version updates for the app's npm dependencies, the release tooling, the base image and the actions, plus security updates once they are turned on in the repo settings ([Dependabot](#dependabot)) | Pinned versions going stale. Every lockfile entry, the base-image digest and every action SHA is pinned on purpose, so without updates a known vulnerability would stay in place after its fix is published. Dependabot proposes each update as a PR, and the required checks still decide whether it merges. Only an update of the app's production dependencies produces a Release. |
