@@ -12,12 +12,15 @@
 #   release  semantic-release for real: the v<version> tag and the GitHub
 #            Release. It runs only after the image is in GHCR, so no tag and
 #            no Release ever exist without their image.
+#   bump     the Bump commit: sets the dev image tag in the chart's dev values
+#            to <version> and pushes that one-line change to main with the
+#            deploy key. ArgoCD deploys it from there.
 #
-# Signing and provenance belong after the push, the SBOM before the GitHub
-# Release, and the Bump commit after it.
+# Signing and provenance belong after the push, and the SBOM before the GitHub
+# Release.
 #
-# The Bump commit will carry [skip ci] in its message. GitHub starts no
-# workflow for a push whose head commit says that, this one included.
+# The Bump commit carries [skip ci] in its message. GitHub starts no workflow
+# for a push whose head commit says that, this one included.
 #
 # Third-party actions are pinned by full commit SHA, with the version in a
 # trailing comment, as in pr.yml.
@@ -188,3 +191,68 @@ jobs:
             exit 1
           fi
           echo "Released \`v${VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # The Bump commit points the dev Environment at the image just released. It
+  # changes only image.tag in the chart's dev values
+  # (scripts/bump-dev-image-tag.sh) and pushes straight to main. ArgoCD then
+  # deploys it; this job never reaches the cluster.
+  #
+  # The push goes over SSH with the bump-commit deploy key, whose private half
+  # is the DEPLOY_KEY secret. A deploy key is the one actor the protect-main
+  # ruleset lets past its pull request requirement. The job token gets no
+  # permission at all: the repo is public, so the checkout needs none, and the
+  # push uses the key, not the token.
+  bump:
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      DEV_VALUES: gitops/charts/sample-nodejs/values-dev.yaml
+    steps:
+      # Without the key, checkout would fall back to the token over HTTPS and
+      # the push would fail later with a less helpful message.
+      - name: Check that the deploy key secret is set
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          if [[ -z "${DEPLOY_KEY}" ]]; then
+            echo "::error::The DEPLOY_KEY secret is not set. The README section \"Bump commit\" says how to create it."
+            exit 1
+          fi
+      # main as it is now, not the released commit, so the Bump commit lands on
+      # top of anything merged since. The key stays in the local git config for
+      # the push below, and checkout's post step removes it. No other action
+      # runs in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          persist-credentials: true
+      - name: Set the dev image tag to the Release version
+        run: scripts/bump-dev-image-tag.sh "${VERSION}"
+      # A re-run after a successful push finds the tag already set and stops
+      # green. A refused push is retried once, after a rebase, only when main
+      # moved on since the checkout.
+      - name: Commit and push the Bump commit to main
+        run: |
+          if git diff --quiet -- "${DEV_VALUES}"; then
+            echo "The dev values already point at \`${VERSION}\`. Nothing to commit." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -m "chore(release): deploy ${VERSION} to dev [skip ci]" -- "${DEV_VALUES}"
+          git show --stat --format='%H %s' HEAD
+          if ! git push origin HEAD:main; then
+            git fetch origin +refs/heads/main:refs/remotes/origin/main
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "::error::The push was refused, but not because main moved on. The git output above says why."
+              exit 1
+            fi
+            echo "::warning::main moved on since the checkout. Rebasing the Bump commit onto it and pushing once more."
+            git rebase origin/main
+            git push origin HEAD:main
+          fi
+          echo "Bump commit \`$(git rev-parse --short HEAD)\` points dev at \`${VERSION}\`." >> "$GITHUB_STEP_SUMMARY"

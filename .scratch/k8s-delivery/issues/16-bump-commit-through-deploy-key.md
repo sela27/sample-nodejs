@@ -6,14 +6,16 @@
 
 **Blocked by:** 05, 11, 15
 
-**Status:** ready-for-agent
+**Status:** done
 
-**Human step:** approve generating a deploy key with write access, storing its private half as an Actions secret, and adding the key to the ruleset bypass list.
+**Human step:** approve generating a deploy key with write access, storing its private half as an Actions secret, and adding the key to the ruleset bypass list. Approved; all three done from this branch.
 
-- [ ] A deploy key is generated for this purpose only. Its public half is on the repo with write access, its private half is an Actions secret, and the local copy is deleted.
-- [ ] The ruleset bypass list contains only this deploy key, applied through ticket 05's script.
-- [ ] After the Release step, the job checks out over SSH with the deploy key, changes only the `dev` image tag, commits `chore(release): deploy <version> to dev [skip ci]`, and pushes to `main`. On a non-fast-forward it rebases and retries once.
-- [ ] This PR seeds the `dev` image tag to `1.0.0`, which already exists in GHCR from ticket 15.
-- [ ] Verified on the next Release (ticket 17): a Bump commit by the deploy key appears on `main`, and no new workflow run starts.
-- [ ] The README gains a "Bump commit" section.
-- [ ] PR title is `ci: …`. Status set to `done` in the same PR.
+**Verified before merge:** `test/bump-dev-image-tag.test.js` runs `scripts/bump-dev-image-tag.sh` against a copy of the dev values: the diff is exactly the tag line, nine malformed versions fail and leave the file unchanged, and a file without the tag fails. `scripts/verify-protection.sh` was extended first and failed on the two new checks, then passed all 22 against the live repo after `scripts/protect-main.sh` was applied. actionlint 1.7.12 passes on the workflows and shellcheck 0.11.0 on the scripts.
+
+- [x] A deploy key is generated for this purpose only. Its public half is on the repo with write access, its private half is an Actions secret, and the local copy is deleted. (ed25519, deploy key `bump-commit`, id 169403968, write access; secret `DEPLOY_KEY`. It was generated in a temp directory outside the repo, piped into `gh secret set`, and both halves were deleted.)
+- [x] The ruleset bypass list contains only this deploy key, applied through ticket 05's script. (GitHub's bypass entry for deploy keys names no key and covers every deploy key of the repo, so the bypass list is that one entry, in `always` mode, and `bump-commit` is the repo's only deploy key. `scripts/verify-protection.sh` checks both.)
+- [x] After the Release step, the job checks out over SSH with the deploy key, changes only the `dev` image tag, commits `chore(release): deploy <version> to dev [skip ci]`, and pushes to `main`. On a non-fast-forward it rebases and retries once.
+- [x] This PR seeds the `dev` image tag to `1.0.0`, which already exists in GHCR from ticket 15.
+- [ ] Verified on the next Release (ticket 17): a Bump commit by the deploy key appears on `main`, and no new workflow run starts. Verified with ticket 17.
+- [x] The README gains a "Bump commit" section.
+- [x] PR title is `ci: …`. Status set to `done` in the same PR.
