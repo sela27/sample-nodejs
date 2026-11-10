@@ -404,6 +404,7 @@ Every pull request to `main` runs these checks, defined in `.github/workflows/pr
 | `secrets` | gitleaks 8.30.1 with its default rules over every commit the PR brings, the ones reachable from the PR head but not from `main`, with full history fetched | any finding, including a secret added in one commit and removed in a later one, because it stays in the PR's history on GitHub |
 | `image-gate` | builds the image with BuildKit and keeps it on the runner, then scans it with Trivy 0.76.2 ([Image Gate](#image-gate)) | any HIGH or CRITICAL vulnerability, including one with no fixed version yet, that `.trivyignore` does not list |
 | `iac-gate` | `scripts/check-iac.sh`: Trivy 0.76.2's misconfiguration checks over the `Dockerfile` and the chart rendered by helm 4.1.4 with the dev values ([IaC Gate](#iac-gate)) | any HIGH or CRITICAL misconfiguration that `.trivyignore` does not list, such as a container without a read-only root filesystem |
+| `sast` | tests with coverage, a SonarQube Cloud analysis of the PR with the official scan action 8.4.1, then `scripts/sast-gate.js` over the Web API ([SAST Gate](#sast-gate)) | any open vulnerability at Blocker or Critical, or with a Security impact of Blocker or High, on the code the PR changes or anywhere on `main` |
 
 Each check is its own job, so a failure shows as its own red check on the PR. The check names are a contract with the [branch protection](#branch-protection) on `main`, which requires them by name. No job sets `name:`, so GitHub names each check after its job id. The PR page shows `PR / test (pull_request)`, but the name the ruleset matches is the bare job id, `test`. A job id therefore never changes unless the ruleset changes in the same PR. New Gates are added as new jobs at the end of the workflow, as new rows in this table, and as required checks in `scripts/protect-main.sh`.
 
@@ -418,6 +419,8 @@ docker build -t sample-nodejs:local . && trivy image --image-src docker --scanne
   --severity HIGH,CRITICAL --ignorefile .trivyignore --exit-code 1 sample-nodejs:local   # needs trivy 0.76.2
 scripts/check-iac.sh     # needs helm 4 and trivy 0.76.2 on PATH
 ```
+
+`sast` has no local equivalent: the analysis runs in SonarQube Cloud, and its results are on the [dashboard](https://sonarcloud.io/project/overview?id=sela27_sample-nodejs).
 
 ### Image Gate
 
@@ -494,6 +497,41 @@ KSV-0014 (HIGH): Container 'app' of Deployment 'sample-nodejs-dev' should set 's
 | `KSV-0110` | LOW | Workloads in the `default` namespace | The rendered manifests name no namespace. ArgoCD applies them into the dev Environment's own namespace. |
 | `KSV-0125` | MEDIUM | Image from an untrusted registry | `ghcr.io` is not on Trivy's built-in list of trusted registries. It is this repo's own registry. |
 
+### SAST Gate
+
+`sast` sends the code to SonarQube Cloud for static analysis, and blocks the PR while the project has an open vulnerability at the top severities. The [SonarQube Cloud dashboard](https://sonarcloud.io/project/overview?id=sela27_sample-nodejs) shows the rest: every issue, the security hotspots and the test coverage, for `main` and for each PR.
+
+1. The job runs the tests with coverage (lcov), then the official scan action, `SonarSource/sonarqube-scan-action` 8.4.1, pinned by SHA. The action downloads the scanner CLI, checks its GPG signature, and the scanner uploads the analysis. On a pull request the scanner sets itself up as a PR analysis. The settings live in `sonar-project.properties`.
+2. `scripts/sast-gate.js` waits until SonarQube Cloud has processed that analysis (`api/ce/task`), and checks that it is an analysis of this PR.
+3. It lists the open vulnerabilities through the Web API (`api/issues/search`). That covers those on `main`, which is the whole project as last merged, and those the PR's analysis raised on the code the PR changes. Any one at **Blocker or Critical** (standard mode), or with a **Security impact of Blocker or High** (Multi-Quality Rule mode), fails the check. The job log lists each one with its rule, file, line and a link. The run summary shows them as a table, and each one becomes an annotation on the PR's diff.
+
+**Why an explicit Gate.** SonarQube Cloud has a built-in quality gate, but the default one, "Sonar way", looks only at new code, so a vulnerability already in the project passes it. Custom quality gates that could check the overall code may not be available on the free plan. So the decision is made in our own script, which asks the Web API directly.
+
+- It checks both severity modes, so it works whichever mode the organization uses.
+- It checks the severities itself rather than through API filters, because the Web API ignores any parameter it does not know. Checked: a made-up parameter returns every issue of the organization. A misspelt filter would therefore pass silently.
+- It refuses to pass when the analysis failed, was not processed within 5 minutes, or was not of this PR.
+
+**On `main`.** `.github/workflows/sast-main.yml` analyzes every push to `main`, so the dashboard shows the code as merged and the PR Gate has a current `main` to check against. There the script runs with `--report-only`: it lists the findings but does not fail on them. Bump commits carry `[skip ci]`, so they are not analyzed. They change only the dev image tag.
+
+**When `main` itself has one.** A new SonarQube rule can find a vulnerability in code that is already on `main`. Then every PR fails until it is dealt with, which is the point. The fix PR fails too, because `main` is re-analyzed only after the merge. To merge it, mark the issue in SonarQube Cloud as Accepted, with a comment linking the fix PR. The analysis of `main` after the merge closes the issue.
+
+**The token.** `SONAR_TOKEN` is a personal access token with a 90-day expiry. It is stored twice: as an Actions secret, and as a Dependabot secret of the same name, because a workflow run that Dependabot starts can read only Dependabot secrets ([Dependabot](#dependabot)). PRs from forks get neither secret, and the Gate fails with a message that says so. To rotate the token, generate a new one under My account → Access Tokens in SonarQube Cloud, then:
+
+```bash
+read -rs SONAR_TOKEN   # paste, then Enter; nothing is printed
+printf '%s' "$SONAR_TOKEN" | gh secret set SONAR_TOKEN
+printf '%s' "$SONAR_TOKEN" | gh secret set SONAR_TOKEN --app dependabot
+unset SONAR_TOKEN
+```
+
+**Setup.** The GitHub account was imported into SonarQube Cloud as an organization on the free plan, with the SonarQubeCloud GitHub app allowed on this repo only. The project's analysis method is GitHub Actions, with Automatic Analysis off. With both on, every CI analysis fails.
+
+`test/sast-gate.test.js` drives the script against a fake Web API in the `test` check:
+
+- A blocking finding, on the PR or on `main`, fails it.
+- Lower severities pass, and so do issues of another project or another type.
+- An analysis that failed, timed out or is not of the PR is an error, never a pass.
+
 ### Supply chain and permissions
 
 - Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
@@ -550,7 +588,7 @@ The `v1.1.0` Release, with the SBOM among its assets:
   gh api -X PUT repos/sela27/sample-nodejs/automated-security-fixes
   ```
 
-- **Secrets.** A workflow run that Dependabot triggers gets a read-only token and only the repo's Dependabot secrets, never its Actions secrets. The current checks need none. A check that does needs its secret added under both, which is why `SONAR_TOKEN` also goes in as a Dependabot secret when the SAST Gate arrives.
+- **Secrets.** A workflow run that Dependabot triggers gets a read-only token and only the repo's Dependabot secrets, never its Actions secrets. Of the required checks only `sast` needs a secret, `SONAR_TOKEN`, so it is stored under both ([SAST Gate](#sast-gate)).
 - **Not covered.** Dependabot does not read the versions pinned with a SHA-256 in the workflows (helm, kubeconform, yq, gitleaks, Trivy, cosign), the Traefik and ArgoCD chart versions, or the tool versions in the README. Those are bumped by hand.
 
 `scripts/check-dependabot.sh` validates the file before it lands, because GitHub reads it only from `main` and a mistake would show up as update PRs that never arrive. It checks the file against the Dependabot configuration schema with check-jsonschema 0.39.0, then against the policy above: the four entries, the weekly schedule, the prefix of each entry, no `include: scope`, and one dependency type per group of the app's updates. It needs [uv](https://docs.astral.sh/uv/) on PATH and prints PASS or FAIL per check:
@@ -756,7 +794,7 @@ scripts/verify-protection.sh    # check what GitHub actually enforces
 The ruleset applies to `refs/heads/main` and is active:
 
 - **A pull request is required**, with zero approvals, because there is a single maintainer. The checks are the review. The ruleset itself also allows squash merges only.
-- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate` and `iac-gate`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
+- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate`, `iac-gate` and `sast`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
 - **Force-push and deletion of `main` are blocked.**
 - **Only the Bump commit's deploy key can bypass it**, and nobody else, the repo admin included. The bypass list holds one entry, deploy keys in `always` mode, so the pipeline can push the [Bump commit](#bump-commit) without a PR ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)). GitHub's deploy key bypass names no single key: it covers every deploy key of the repo. So `bump-commit` must stay the repo's only deploy key, and `scripts/verify-protection.sh` fails if another one appears. `always` records each bypass in the rule insights, where `exempt` would skip the rules without a trace.
 
@@ -789,6 +827,7 @@ Each security control in the delivery path, where it is enforced, and what it st
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
+| Static analysis (SAST) | The `sast` check on every PR (SonarQube Cloud, through `scripts/sast-gate.js`), required on `main` by the ruleset. Every push to `main` is analyzed for the dashboard ([SAST Gate](#sast-gate)) | A PR merging while the project has an open vulnerability at the top severities, such as a command or SQL injection built from user input, whether the PR adds it or it is already on `main`. Unlike SonarQube's default quality gate, it does not stop at new code. |
 | Dependency updates | Dependabot (`.github/dependabot.yml`): weekly version updates for the app's npm dependencies, the release tooling, the base image and the actions, plus security updates once they are turned on in the repo settings ([Dependabot](#dependabot)) | Pinned versions going stale. Every lockfile entry, the base-image digest and every action SHA is pinned on purpose, so without updates a known vulnerability would stay in place after its fix is published. Dependabot proposes each update as a PR, and the required checks still decide whether it merges. Only an update of the app's production dependencies produces a Release. |
 | Signed image with build provenance | The release `image` job: a keyless cosign signature and an `actions/attest` SLSA provenance attestation on the pushed digest ([Image signature and provenance](#image-signature-and-provenance)) | An image that this repo's release workflow on `main` did not build passing as a Release: one pushed by hand, swapped behind a tag, or built by a fork or a PR run fails `cosign verify` and `gh attestation verify`. The cluster does not check it yet. |
 

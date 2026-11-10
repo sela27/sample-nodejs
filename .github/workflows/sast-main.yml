@@ -1,0 +1,53 @@
+# SAST on main: every push to main is analyzed by SonarQube Cloud, so the
+# dashboard shows the code as merged, and the PR Gate (the sast job in pr.yml)
+# compares each PR against it. Here the Gate only reports: it lists any open
+# vulnerability at the top severities in the job log and the run summary,
+# and never fails on findings. A failed or unprocessed analysis still fails
+# the run, because then the dashboard is out of date.
+#
+# GitHub starts no workflow for a push whose head commit says [skip ci], so
+# Bump commits, which change only the dev image tag, are not analyzed.
+name: SAST (main)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Only the newest commit on main needs to reach the dashboard.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  sast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SONAR_HOST_URL: https://sonarcloud.io
+    steps:
+      # The same steps as the sast job in pr.yml; keep them in step.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Test coverage
+        run: |
+          npm ci --ignore-scripts
+          node --test --experimental-test-coverage \
+            --test-reporter=lcov --test-reporter-destination=lcov.info \
+            --test-reporter=dot --test-reporter-destination=stdout \
+            || echo "::warning::A test failed. Coverage may be partial."
+      - uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Report open vulnerabilities
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: node scripts/sast-gate.js --report-only

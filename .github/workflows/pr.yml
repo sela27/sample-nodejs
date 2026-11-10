@@ -251,3 +251,46 @@ jobs:
           echo "$bin" >> "$GITHUB_PATH"
           "$bin/helm" version --short
       - run: scripts/check-iac.sh
+
+  # SAST Gate: SonarQube Cloud analyzes the PR, then scripts/sast-gate.js waits
+  # until the analysis is processed and fails the check on any open
+  # vulnerability at BLOCKER or CRITICAL (standard mode) or with a SECURITY
+  # impact of BLOCKER or HIGH (MQR mode): on the code this PR changes, or
+  # anywhere on main. The built-in quality gate is not used, because "Sonar
+  # way" checks only new code. Settings live in sonar-project.properties.
+  # SONAR_TOKEN is an Actions secret and, for Dependabot's PRs, a Dependabot
+  # secret of the same name.
+  sast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SONAR_HOST_URL: https://sonarcloud.io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: SonarQube Cloud reads blame to tell new code from old.
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      # Coverage for the dashboard, as lcov. A failing test does not fail
+      # this job: the test job reports it, so a red sast always means SAST.
+      - name: Test coverage
+        run: |
+          npm ci --ignore-scripts
+          node --test --experimental-test-coverage \
+            --test-reporter=lcov --test-reporter-destination=lcov.info \
+            --test-reporter=dot --test-reporter-destination=stdout \
+            || echo "::warning::A test failed; the test check reports it. Coverage may be partial."
+      # The action downloads the scanner CLI and checks its GPG signature. On a
+      # pull_request event the scanner sets up a PR analysis by itself.
+      - uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Gate on open vulnerabilities
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/sast-gate.js --pull-request "$PR_NUMBER"
