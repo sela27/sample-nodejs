@@ -1,0 +1,13 @@
+{
+  "name": "sample-nodejs-release",
+  "private": true,
+  "description": "Release tooling only, pinned exactly: semantic-release and its Conventional Commits preset. Not part of the app or its image.",
+  "license": "ISC",
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "devDependencies": {
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "25.0.9"
+  }
+}

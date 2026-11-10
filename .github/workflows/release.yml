@@ -1,0 +1,190 @@
+# Release pipeline: what every push to main runs.
+#
+# A push to main is a squash-merged PR, so its commit message is the PR title,
+# a Conventional Commit. The jobs run in this order, each only if the one
+# before it succeeded:
+#
+#   version  semantic-release dry run: the next version, or none. With none,
+#            the run ends here, green.
+#   image    BuildKit build tagged <version> and sha-<short>, the image Gate,
+#            then the push to GHCR. A Gate failure stops the job before it
+#            logs in to the registry.
+#   release  semantic-release for real: the v<version> tag and the GitHub
+#            Release. It runs only after the image is in GHCR, so no tag and
+#            no Release ever exist without their image.
+#
+# Signing and provenance belong after the push, the SBOM before the GitHub
+# Release, and the Bump commit after it.
+#
+# The Bump commit will carry [skip ci] in its message. GitHub starts no
+# workflow for a push whose head commit says that, this one included.
+#
+# Third-party actions are pinned by full commit SHA, with the version in a
+# trailing comment, as in pr.yml.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Read-only by default. A job that needs more asks for it in its own
+# `permissions:` block.
+permissions:
+  contents: read
+
+# One release run at a time, and a run in progress is never cancelled: a
+# cancelled run could leave an image in GHCR without its Release. A push that
+# lands meanwhile waits for it. GitHub keeps only the newest waiting run and
+# cancels older waiting ones, which loses nothing: semantic-release reads every
+# commit since the last Release tag, so the newest run releases them all.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # semantic-release in dry-run mode (release/next-version.mjs) reads the
+  # commits since the last Release tag, logs a verdict for each and the notes
+  # it would publish, and creates nothing. Its output `version` is empty when
+  # no commit warrants a Release, and the later jobs are then skipped.
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      # Before it analyzes anything, semantic-release checks with
+      # `git push --dry-run` that it could push the tag, also in dry-run mode.
+      # GitHub refuses that check to a read-only token. The job pushes nothing.
+      contents: write
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Every commit and tag, which semantic-release reads.
+          fetch-depth: 0
+      # No dependency cache in this workflow, so a cache entry cannot change
+      # what the release runs: every run installs exactly what
+      # release/package-lock.json pins, from the registry.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the pinned release tooling
+        working-directory: release
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Decide the next version
+        id: next
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node release/next-version.mjs
+
+  # The image Gate before the push: the same pinned Trivy, flags and
+  # .trivyignore as the image-gate job in pr.yml, so the image is scanned
+  # again against today's vulnerability database before it reaches the
+  # registry. If the scan fails, the login and push steps never run, and the
+  # release job is skipped.
+  image:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Keep these two in step with the image-gate job in pr.yml.
+      TRIVY_VERSION: 0.76.2
+      TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+      # The private GHCR package. The chart's dev values use the same name.
+      IMAGE: ghcr.io/sela27/sample-nodejs
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Through the GitHub API with the job token, as in pr.yml.
+      - name: Install pinned Trivy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          gh release download "v${TRIVY_VERSION}" --repo aquasecurity/trivy \
+            --pattern "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" --output trivy.tar.gz
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/trivy" --version
+      # Loaded into the runner's Docker engine, not pushed yet. The source
+      # label tells GHCR which repo the package belongs to.
+      - name: Build the image with BuildKit, tagged with the version and the commit
+        run: |
+          docker buildx version
+          docker buildx build --load \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:sha-${GITHUB_SHA::7}" \
+            .
+      - name: Scan the image for HIGH and CRITICAL vulnerabilities
+        run: |
+          trivy image \
+            --image-src docker \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignorefile .trivyignore \
+            --format table \
+            --exit-code 1 \
+            --no-progress \
+            "${IMAGE}:${VERSION}"
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "${REGISTRY_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+      # The image that passed the scan, by its two tags.
+      - name: Push the image to GHCR
+        run: |
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
+          echo "Pushed \`${IMAGE}:${VERSION}\` and \`${IMAGE}:sha-${GITHUB_SHA::7}\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # semantic-release for real, with .releaserc.yaml: it tags this commit
+  # v<version> and creates the GitHub Release with the notes. No npm publish,
+  # and no commit back to the repo.
+  release:
+    needs: [version, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      # Push the tag and create the GitHub Release.
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the pinned release tooling
+        working-directory: release
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Create the tag and the GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: release/node_modules/.bin/semantic-release
+      # semantic-release exits 0 without releasing when main has moved on
+      # since this run started. The image above is then in GHCR without a
+      # Release, so the run must not look green.
+      - name: Check that the Release has the version of the pushed image
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/v${VERSION}" > /dev/null; then
+            echo "::error::No tag v${VERSION}, although image ${VERSION} was pushed to GHCR. The semantic-release log above says why."
+            exit 1
+          fi
+          echo "Released \`v${VERSION}\`." >> "$GITHUB_STEP_SUMMARY"

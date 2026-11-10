@@ -233,12 +233,79 @@ Like the other tools hosted on GitHub releases, the file is fetched through the 
 
 - Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
 - The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
-- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate`) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
+- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate` and in the release `image` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
 - gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
-- The workflow's default token permission is `contents: read` and nothing else. A job that needs more, such as pushing an image or creating a Release, asks for it in its own `permissions:` block.
+- Each workflow's default token permission is `contents: read` and nothing else. A job that needs more asks for it in its own `permissions:` block. Only the release workflow does, as listed in [Release flow](#release-flow).
 - `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps.
 - `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
-- A new push to a PR cancels that PR's run still in progress.
+- A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
+
+## Release flow
+
+A squash merge into `main` becomes one commit, and its message is the PR title, a Conventional Commit. That commit type alone decides whether the merge produces a Release. `.github/workflows/release.yml` runs on every push to `main` and never on a pull request.
+
+| Commit type | Release |
+| --- | --- |
+| `feat` | minor, for example 1.2.0 to 1.3.0 |
+| `fix`, `perf`, or a revert | patch, for example 1.2.0 to 1.2.1 |
+| any type with a breaking change (`feat!:` or a `BREAKING CHANGE:` footer) | major, for example 1.2.0 to 2.0.0 |
+| `ci`, `docs`, `chore`, `build`, `test`, `refactor`, `style` | none |
+
+The first Release is 1.0.0, whatever the type. Only changes to the app or its production dependencies use `feat` or `fix`. Chart, cluster, CI, build, test and docs changes use the other types, so they never ship a new image.
+
+The run has three jobs. Each one starts only if the one before it succeeded:
+
+1. **`version`** runs semantic-release in dry-run mode (`release/next-version.mjs`). It reads the commits since the last `v*` tag, logs a verdict for each commit and the release notes it would publish, and creates nothing. If no commit warrants a Release, it logs `No Release from this commit`, and the run ends there, green, with the other two jobs skipped.
+2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge.
+3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes. A last step checks that the tag exists. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
+
+**A Gate failure leaves nothing behind.** When the scan fails, the `image` job stops at that step. Its login and push steps show as skipped, so nothing reaches GHCR. The `release` job is skipped as well, so no tag and no GitHub Release are created. The job order guarantees this. The job that creates the tag starts only after the job that pushes, and that job pushes only after the scan passes.
+
+**Job permissions.** The workflow default is `contents: read`. Each job raises only what it uses, and no job gets `issues`, `pull-requests`, `id-token` or `attestations`.
+
+| Job | Token permissions | Why |
+| --- | --- | --- |
+| `version` | `contents: write` | Before it analyzes anything, semantic-release checks with `git push --dry-run` that it could push the tag, even in dry-run mode. GitHub refuses that check to a read-only token. The job pushes nothing. |
+| `image` | `contents: read`, `packages: write` | Push the image to GHCR. |
+| `release` | `contents: write` | Push the tag and create the GitHub Release. |
+
+**One run at a time.** All release runs share one concurrency group, and a run in progress is never cancelled, because a cancelled run could leave an image in GHCR without its Release. A push that lands meanwhile waits. GitHub keeps only the newest waiting run and cancels older waiting ones. That loses nothing, because semantic-release reads every commit since the last Release tag, so the newest run releases them all. The Bump commit will carry `[skip ci]`, so GitHub starts no run for it.
+
+**The semantic-release config**, in `.releaserc.yaml`:
+
+- The release branch is `main`, and tags are `v${version}`.
+- The commit analyzer and the release notes generator use the `conventionalcommits` preset. The notes list features, bug fixes, performance improvements and reverts, and leave out `ci`, `docs`, `chore`, `build`, `test`, `refactor` and `style` commits.
+- The GitHub plugin creates the GitHub Release. It is set not to comment on the released PRs and not to open an issue when a release fails, because both would need write access to issues and pull requests.
+- There is no npm plugin, so nothing is published to the npm registry, and no git plugin, so nothing is committed back. The git tag is the source of truth for the version. `package.json` keeps its `version` field as it is, and there is no `CHANGELOG.md`, because the notes live in the GitHub Release.
+
+**Pinned release tooling.** `release/package.json` pins semantic-release 25.0.9 and `conventional-changelog-conventionalcommits` 9.3.1 exactly, and `release/package-lock.json` pins every package below them, with its integrity hash. Both semantic-release jobs install it with `npm ci --ignore-scripts` and no dependency cache. It is a separate manifest, rather than root dev dependencies or `npx`:
+
+- `npx semantic-release@25.0.9` pins only the top package. Its roughly 300 dependencies would resolve afresh from version ranges on every run, so a bad release of any of them would run in a job that holds a write token. The lockfile fixes the whole tree.
+- Root dev dependencies would add those packages to the app's lockfile, to every `test` job install and to `npm audit` of the app, for tooling the app never runs.
+- The `.dockerignore` allowlist keeps `release/` and `.releaserc.yaml` out of the build context, so the image is unchanged.
+
+The preset is 9.3.1, not the newer 10.x. The 10.x preset needs `conventional-changelog-writer` 9, while the release notes generator that semantic-release 25.0.9 bundles uses writer 8. With 10.4.1, the dry run failed at the `generateNotes` step.
+
+**The first Release.** A dry run on 2026-11-10 predicted `v1.0.0`. It ran over `main` at `510c9f5` plus this pipeline's own `ci:` commit, the way the `version` job will run after the merge. Of the 18 commits it analyzed, only `fix(deps): update the vulnerable dependencies caught by the new image Gate (#10)` warrants a Release (a patch). Every `ci`, `docs`, `chore`, `build` and `test` commit, the pipeline's own included, warrants none. The notes it would publish, with the date of the run:
+
+```markdown
+## 1.0.0 (2026-11-10)
+
+### Bug Fixes
+
+* **deps:** update the vulnerable dependencies caught by the new image Gate ([#10](https://github.com/sela27/sample-nodejs/issues/10)) ([1511b7b](https://github.com/sela27/sample-nodejs/commit/1511b7b320b07f866fa7467623f90fc435d5dab6))
+```
+
+The first push creates the GHCR package, which is private by default. The image's `org.opencontainers.image.source` label tells GHCR which repo the package belongs to. After that first push, the package settings are checked by hand: the package must be private and linked to this repo.
+
+To preview the next Release locally, run the same dry run as the `version` job from an up-to-date `main`. The token lets the GitHub plugin check the repo. Nothing is tagged or published.
+
+```bash
+npm ci --prefix release --ignore-scripts
+GITHUB_TOKEN="$(gh auth token)" node release/next-version.mjs
+```
+
+Run it only on `main`. On any other branch, semantic-release force-updates the local `main` from GitHub before it declines to release.
 
 ## Branch protection
 
@@ -280,4 +347,4 @@ Each security control in the delivery path, where it is enforced, and what it st
 | No Kubernetes API token | ServiceAccount and pod `automountServiceAccountToken: false` | A compromised pod using an API token to read or change cluster objects. |
 | Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)) | The `read:packages` token reaching the repo. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
-| Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
+| Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |

@@ -160,7 +160,8 @@ jobs:
       # through aquasecurity/trivy-action or setup-trivy, whose tags were
       # hijacked on 2026-03-19 (CVE-2026-33634). 0.76.2 is an immutable
       # GitHub release, outside the compromised 0.69.4-0.69.6, and past every
-      # published Trivy advisory.
+      # published Trivy advisory. The image job in release.yml runs the same
+      # scan before every push to GHCR; keep its two values in step.
       TRIVY_VERSION: 0.76.2
       TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
       IMAGE: sample-nodejs:${{ github.sha }}
