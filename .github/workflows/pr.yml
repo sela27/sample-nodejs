@@ -205,3 +205,47 @@ jobs:
             --exit-code 1 \
             --no-progress \
             "$IMAGE"
+
+  # IaC Gate: Trivy's misconfiguration checks over the Dockerfile and over the
+  # chart as ArgoCD applies it, rendered by helm with the dev values rather
+  # than scanned as raw templates. Any HIGH or CRITICAL finding fails the
+  # check. Accepted exceptions live in .trivyignore, each with its
+  # justification. scripts/check-iac.sh holds the scan, so a local run matches
+  # this job.
+  iac-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      # The same pins as helm in the chart job and Trivy in image-gate; keep
+      # them in step.
+      HELM_VERSION: v4.1.4
+      HELM_SHA256: 70b2c30a19da4db264dfd68c8a3664e05093a361cefd89572ffb36f8abfa3d09
+      TRIVY_VERSION: 0.76.2
+      TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Retries for get.helm.sh and the API for the GitHub release, for the
+      # same reasons as in the chart and image-gate jobs. These are the job's
+      # only downloads: the scan uses the checks embedded in the pinned Trivy
+      # binary and does not fetch Trivy's checks bundle.
+      - name: Install pinned helm and Trivy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          gh release download "v${TRIVY_VERSION}" --repo aquasecurity/trivy \
+            --pattern "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" --output trivy.tar.gz
+          sha256sum -c - <<EOF
+          ${HELM_SHA256}  helm.tar.gz
+          ${TRIVY_SHA256}  trivy.tar.gz
+          EOF
+          tar -xzf helm.tar.gz -C "$bin" --strip-components=1 linux-amd64/helm
+          tar -xzf trivy.tar.gz -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/helm" version --short
+      - run: scripts/check-iac.sh
