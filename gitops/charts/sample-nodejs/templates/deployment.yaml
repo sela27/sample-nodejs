@@ -11,6 +11,18 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  # A rollout starts the new pod first and removes an old one only once the new
+  # one is ready, so the number of ready pods never drops below the count.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  # A rollout that makes no progress for this long (a new pod that never turns
+  # ready, say) is marked failed, and ArgoCD then shows the Deployment as
+  # Degraded. The default is ten minutes, too long to wait. Three minutes
+  # covers an image pull and the startup probe (up to 30 s) with room to spare.
+  progressDeadlineSeconds: 180
   selector:
     matchLabels:
       {{- include "sample-nodejs.selectorLabels" . | nindent 6 }}
@@ -28,6 +40,11 @@ spec:
       # Also set on the ServiceAccount; set here too, because the pod's own
       # setting is the one that wins.
       automountServiceAccountToken: false
+      # Time from the start of termination to SIGKILL. It covers the preStop
+      # pause (5 s) and then the app's own shutdown, which waits up to
+      # SHUTDOWN_TIMEOUT_MS (10 s by default) for open connections. 30 s leaves
+      # 15 s to spare.
+      terminationGracePeriodSeconds: 30
       # The restricted Pod Security profile. These settings are written here,
       # not taken from values, so no Environment's values file can loosen them.
       securityContext:
@@ -59,6 +76,15 @@ spec:
             - name: http
               containerPort: {{ .Values.config.port }}
               protocol: TCP
+          # Runs before SIGTERM. Kubernetes removes the pod from the Service's
+          # endpoints at the same moment it starts terminating, but Traefik
+          # learns of that a little later and may still send requests meanwhile.
+          # The pause keeps the app serving until Traefik has dropped the pod.
+          # The native sleep action needs no shell in the image (Kubernetes 1.30+).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           # Holds off the other probes until the app has started once, so a slow
           # start is not mistaken for a hung process.
           startupProbe:

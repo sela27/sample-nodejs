@@ -4,7 +4,8 @@
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
-# rollout checksum, the HPA and the PodDisruptionBudget, the NetworkPolicy that
+# rollout checksum, the HPA and the PodDisruptionBudget, the zero-downtime
+# rollout settings, the NetworkPolicy that
 # admits only Traefik to the app port, the standard labels, and that the TLS
 # flag adds the TLS section and the cert-manager issuer annotation and nothing
 # else, and that the ServiceMonitor flag, off by default, adds only a
@@ -467,6 +468,36 @@ if render_with hpa-off-default --set autoscaling.enabled=false; then
   expect "HPA off: PDB lets a pod go at the default replicaCount" "room" \
     "$(pdb_room "$variant" "$(qf "$variant" "$deployment | .spec.replicas")")"
 fi
+
+# Zero-downtime rollouts: a rollout never lowers the number of ready pods and
+# never cuts a request short. The numbers below come from the app and the spec.
+# The app's default SHUTDOWN_TIMEOUT_MS (app.js), in seconds.
+APP_SHUTDOWN_TIMEOUT_SECONDS="10"
+# A stuck rollout must turn Degraded in ArgoCD within a few minutes, so the
+# progress deadline stays at or below this (ticket 24 relies on it).
+MAX_PROGRESS_DEADLINE_SECONDS="300"
+# The hooks of the app container.
+pre_stop="$container | .lifecycle.preStop"
+
+expect "rollout strategy" "RollingUpdate" "$(q "$deployment | .spec.strategy.type")"
+expect "rollout never takes a pod away first: maxUnavailable" "0" \
+  "$(q "$deployment | .spec.strategy.rollingUpdate.maxUnavailable")"
+expect "rollout adds one pod at a time: maxSurge" "1" "$(q "$deployment | .spec.strategy.rollingUpdate.maxSurge")"
+# Traefik learns of a terminating pod a moment after SIGTERM would reach it, so
+# the pod waits before the app is told to stop. The native sleep action needs
+# no shell in the image.
+pre_stop_seconds="$(q "$pre_stop | .sleep.seconds")"
+expect "preStop is a native sleep" "set" \
+  "$([[ "$pre_stop_seconds" =~ ^[0-9]+$ ]] && ((pre_stop_seconds > 0)) && echo set || echo "'$pre_stop_seconds'")"
+expect "preStop pause is short" "short" \
+  "$([[ "$pre_stop_seconds" =~ ^[0-9]+$ ]] && ((pre_stop_seconds <= 15)) && echo short || echo "'$pre_stop_seconds' s")"
+# The grace period covers the preStop pause and then the app's own shutdown.
+grace="$(q "$deployment | .spec.template.spec.terminationGracePeriodSeconds")"
+expect "grace period outlasts the preStop pause plus the app's shutdown timeout" "long enough" \
+  "$([[ "$grace" =~ ^[0-9]+$ && "$pre_stop_seconds" =~ ^[0-9]+$ ]] && ((grace > pre_stop_seconds + APP_SHUTDOWN_TIMEOUT_SECONDS)) && echo "long enough" || echo "grace '$grace' s, preStop '$pre_stop_seconds' s, app timeout $APP_SHUTDOWN_TIMEOUT_SECONDS s")"
+deadline="$(q "$deployment | .spec.progressDeadlineSeconds")"
+expect "progress deadline is set and at most $MAX_PROGRESS_DEADLINE_SECONDS s" "short enough" \
+  "$([[ "$deadline" =~ ^[0-9]+$ ]] && ((deadline <= MAX_PROGRESS_DEADLINE_SECONDS)) && echo "short enough" || echo "'$deadline'")"
 
 ingress='select(.kind == "Ingress")'
 backends="$ingress | .spec.rules[].http.paths[].backend.service"
