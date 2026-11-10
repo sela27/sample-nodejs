@@ -283,6 +283,23 @@ KSV-0014 (HIGH): Container 'app' of Deployment 'sample-nodejs-dev' should set 's
 - `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
 - A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
 
+**An SBOM on every Release.** Each GitHub Release carries `sample-nodejs-<version>.cdx.json`, a CycloneDX JSON SBOM (software bill of materials) of the image it released. It lists every package in the image, the Alpine packages and the app's npm dependencies, each with its version and package URL. The release run makes it like this:
+
+1. After the push, the `image` job reads the digest of `ghcr.io/sela27/sample-nodejs:<version>` back from GHCR with `docker buildx imagetools inspect`, so it is the digest the registry serves, not one taken from the runner's Docker engine.
+2. The same pinned Trivy 0.76.2 as the image Gate reads the image at that digest from GHCR (`--image-src remote`, not the local copy) and writes the SBOM (`--format cyclonedx`). The SBOM therefore describes exactly the image the cluster pulls. It names that digest in its metadata, in the `aquasecurity:trivy:RepoDigest` property, and the job fails if the SBOM has no components or names another image.
+3. The file goes to the `release` job as a workflow artifact, and `@semantic-release/github` uploads it to the GitHub Release, through the `assets` entry in `.releaserc.yaml`. The plugin only logs a warning when an asset file is missing, and still creates the Release, so the job then downloads the asset back from the Release and compares it byte for byte with the file it uploaded. A Release without its SBOM turns the run red.
+
+Trivy makes the SBOM rather than a second tool such as Syft because it is already in the job, pinned and checked against its SHA-256, so there is nothing new to pin or trust. The SBOM holds the inventory only, no vulnerabilities: a vulnerability list would be out of date within days. Instead, the SBOM lets anyone scan a released image again against today's vulnerability database without pulling it from the private package. To check the SBOM of a Release (`v1.0.0` predates the SBOM and has none):
+
+```bash
+v=1.1.0
+gh release download "v$v" --repo sela27/sample-nodejs --pattern "sample-nodejs-$v.cdx.json"
+docker run --rm -v "$PWD:/sbom:ro" cyclonedx/cyclonedx-cli:0.33.1 \
+  validate --input-file "/sbom/sample-nodejs-$v.cdx.json" --input-format json --fail-on-errors
+jq -r '.metadata.component.properties[] | select(.name == "aquasecurity:trivy:RepoDigest").value' "sample-nodejs-$v.cdx.json"
+trivy sbom --severity HIGH,CRITICAL "sample-nodejs-$v.cdx.json"   # the image's vulnerabilities as of today
+```
+
 ### Dependabot
 
 `.github/dependabot.yml` has Dependabot look for version updates once a week, on Monday, wherever this repo pins a dependency. Its PRs are ordinary PRs to `main`: they run every required check and merge only when all of them pass, so an update that breaks a test, the chart or the image Gate cannot land.
@@ -333,8 +350,8 @@ The first Release is 1.0.0, whatever the type. Only changes to the app or its pr
 The run has four jobs. Each one starts only if the one before it succeeded:
 
 1. **`version`** runs semantic-release in dry-run mode (`release/next-version.mjs`). It reads the commits since the last `v*` tag, logs a verdict for each commit and the release notes it would publish, and creates nothing. If no commit warrants a Release, it logs `No Release from this commit`, and the run ends there, green, with the other three jobs skipped.
-2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge.
-3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes. A last step checks that the tag exists. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
+2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge. Last, it reads the pushed digest back from GHCR and generates the CycloneDX SBOM of the image at that digest ([An SBOM on every Release](#supply-chain-and-permissions)).
+3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes and the SBOM as an asset. Two last steps check that the tag exists and that the Release carries the SBOM. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
 4. **`bump`** makes the [Bump commit](#bump-commit): it sets the dev image tag to the version and pushes that one-line change to `main` with the deploy key. ArgoCD deploys it from there.
 
 **A Gate failure leaves nothing behind.** When the scan fails, the `image` job stops at that step. Its login and push steps show as skipped, so nothing reaches GHCR. The `release` and `bump` jobs are skipped as well, so no tag, no GitHub Release and no Bump commit are created. The job order guarantees this. The job that creates the tag starts only after the job that pushes, and that job pushes only after the scan passes.
@@ -344,8 +361,8 @@ The run has four jobs. Each one starts only if the one before it succeeded:
 | Job | Token permissions | Why |
 | --- | --- | --- |
 | `version` | `contents: write` | Before it analyzes anything, semantic-release checks with `git push --dry-run` that it could push the tag, even in dry-run mode. GitHub refuses that check to a read-only token. The job pushes nothing. |
-| `image` | `contents: read`, `packages: write` | Push the image to GHCR. |
-| `release` | `contents: write` | Push the tag and create the GitHub Release. |
+| `image` | `contents: read`, `packages: write` | Push the image to GHCR, and read it back from there for the SBOM. |
+| `release` | `contents: write` | Push the tag, create the GitHub Release and upload the SBOM to it. |
 | `bump` | none | The repo is public, so the checkout needs no token, and the push uses the deploy key. |
 
 **One run at a time.** All release runs share one concurrency group, and a run in progress is never cancelled, because a cancelled run could leave an image in GHCR without its Release. A push that lands meanwhile waits. GitHub keeps only the newest waiting run and cancels older waiting ones. That loses nothing, because semantic-release reads every commit since the last Release tag, so the newest run releases them all. The Bump commit carries `[skip ci]`, so GitHub starts no run for it.
@@ -354,7 +371,7 @@ The run has four jobs. Each one starts only if the one before it succeeded:
 
 - The release branch is `main`, and tags are `v${version}`.
 - The commit analyzer and the release notes generator use the `conventionalcommits` preset. The notes list features, bug fixes, performance improvements and reverts, and leave out `ci`, `docs`, `chore`, `build`, `test`, `refactor` and `style` commits.
-- The GitHub plugin creates the GitHub Release. It is set not to comment on the released PRs and not to open an issue when a release fails, because both would need write access to issues and pull requests.
+- The GitHub plugin creates the GitHub Release. It is set not to comment on the released PRs and not to open an issue when a release fails, because both would need write access to issues and pull requests. Its one asset is the SBOM, `sbom/sample-nodejs-*.cdx.json`, which the `release` job downloads from the `image` job before semantic-release runs.
 - There is no npm plugin, so nothing is published to the npm registry, and no git plugin, so nothing is committed back. The git tag is the source of truth for the version. `package.json` keeps its `version` field as it is, and there is no `CHANGELOG.md`, because the notes live in the GitHub Release.
 
 **Pinned release tooling.** `release/package.json` pins semantic-release 25.0.9 and `conventional-changelog-conventionalcommits` 9.3.1 exactly, and `release/package-lock.json` pins every package below them, with its integrity hash. Both semantic-release jobs install it with `npm ci --ignore-scripts` and no dependency cache. It is a separate manifest, rather than root dev dependencies or `npx`:
