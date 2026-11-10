@@ -61,6 +61,41 @@ With the tunnel up, open the app in the browser at [http://sample-nodejs.127.0.0
 
 The defaults fit Docker Desktop with about 6 GB of memory. minikube cannot resize an existing cluster, so a new CPU or memory value takes effect only after `minikube delete`. Traefik's version is pinned in `gitops/apps/traefik.yaml` (chart 42.3.1, Traefik v3.7.17).
 
+## Verifying a Deploy
+
+`scripts/smoke-test.sh` checks a Deploy from outside the cluster, the way a client reaches the app: through Traefik, with the Ingress host. It is the only end-to-end test. In one pass it covers the chart, Traefik, the Public path allowlist on the Ingress and the ArgoCD Deploy. Run it once ArgoCD shows `sample-nodejs-dev` Synced, for example after a [Bump commit](#bump-commit). It runs against the local cluster only, not in CI, because the pipeline never reaches the cluster.
+
+| Path | Expected | Why |
+| --- | --- | --- |
+| `/my-app` | 200 and `Hello, World!` | Public path |
+| `/about` | 200 | Public path |
+| `/classified`, `/metrics`, `/ready` | 404 | Internal: the app serves them with 200, but the Ingress has no route for them, so Traefik answers its own 404 |
+
+It prints PASS or FAIL for each path, with the status it got, and exits non-zero if any path fails. By default it goes through `minikube tunnel`. Without the tunnel, `--port-forward` makes the script port-forward the Traefik Service itself and send each request to that port with the `Host` header, so Traefik routes it exactly as it routes a request through the tunnel:
+
+```bash
+scripts/smoke-test.sh                  # through the tunnel, at http://sample-nodejs.127.0.0.1.nip.io
+scripts/smoke-test.sh --port-forward   # without the tunnel, through a port-forward to Traefik
+```
+
+```text
+PASS  /my-app      200 "Hello, World!"
+PASS  /about       200
+PASS  /classified  404
+PASS  /metrics     404
+PASS  /ready       404
+
+All paths passed.
+```
+
+A failure names the path, what it expected and what it got, for example `FAIL  /classified  expected 404, got 200` if the Ingress exposed an internal path. If nothing answers, the script says to start the tunnel or use `--port-forward`. On Windows, run it from Git Bash.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_HOST` | `sample-nodejs.127.0.0.1.nip.io` | Ingress host of the Environment, sent as the `Host` header |
+| `BASE_URL` | `http://$APP_HOST` | Scheme, host and port the requests go to, such as your own port-forward to Traefik. Not used with `--port-forward`. |
+| `MINIKUBE_PROFILE` | `minikube` | kubectl context for `--port-forward` |
+
 ## Running tests
 
 ```bash
