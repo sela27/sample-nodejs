@@ -81,3 +81,21 @@ networkPolicy:
     # The labels that Traefik's official chart puts on its pods.
     podLabels:
       app.kubernetes.io/name: traefik
+  # Admitted as well while serviceMonitor.enabled is on, so Prometheus can
+  # scrape /metrics. Matched by namespace only.
+  monitoring:
+    # The namespace Prometheus runs in (kube-prometheus-stack's usual one).
+    namespace: monitoring
+
+# A ServiceMonitor for a Prometheus Operator, off by default so the cluster
+# needs no monitoring CRDs. Turning it on adds the ServiceMonitor, which scrapes
+# /metrics on the Service's port `http`, and admits networkPolicy.monitoring in
+# the NetworkPolicy.
+serviceMonitor:
+  enabled: false
+  # How often Prometheus scrapes.
+  interval: 30s
+  # Extra labels on the ServiceMonitor, for the Prometheus that should pick it
+  # up. kube-prometheus-stack selects on its Helm release name, for example
+  # `release: kube-prometheus-stack`.
+  labels: {}

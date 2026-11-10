@@ -1,0 +1,10 @@
+servicemonitor_v1.json is the JSON schema of the Prometheus Operator's ServiceMonitor
+(monitoring.coreos.com/v1) CRD, vendored so the chart check does not download it.
+
+Source: https://github.com/datreeio/CRDs-catalog
+        monitoring.coreos.com/servicemonitor_v1.json
+Commit: 49729e49e8f062933e3716a26540d41b0cd0856c
+SHA-256: 78062f4c2364bf6056a8df40cfb7039936f836014aff2078c0c598dfce69c51e
+
+scripts/check-chart.sh passes it to kubeconform as a schema location. To update it,
+download the file from a newer commit, replace it, and update the lines above.

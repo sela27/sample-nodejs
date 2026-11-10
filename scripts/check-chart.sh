@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Chart Gate: lints the Helm chart, renders it with the dev values (once as
-# is, once with Ingress TLS on), validates the rendered manifests against the
+# is, once with Ingress TLS on, once with the ServiceMonitor on), validates the rendered manifests against the
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
@@ -8,7 +8,9 @@
 # rollout settings, the NetworkPolicy that
 # admits only Traefik to the app port, the standard labels, and that the TLS
 # flag adds the TLS section and the cert-manager issuer annotation and nothing
-# else.
+# else, and that the ServiceMonitor flag, off by default, adds only a
+# ServiceMonitor for /metrics and the monitoring namespace as a second peer of
+# the NetworkPolicy.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits
@@ -33,6 +35,24 @@ RELEASE="sample-nodejs-dev"
 TLS_ISSUER="check-chart-issuer"
 TLS_ON=(--set ingress.tls.enabled=true --set-string "ingress.tls.clusterIssuer=$TLS_ISSUER")
 
+# The ServiceMonitor is off by default. A third render turns it on with values
+# that differ from the defaults, so the checks show that the values reach the
+# objects: a Prometheus selector label (kube-prometheus-stack matches on
+# `release`), a scrape interval and a monitoring namespace.
+SM_LABEL_KEY="release"
+SM_LABEL_VALUE="check-chart-prometheus"
+SM_INTERVAL="45s"
+SM_NAMESPACE="check-chart-monitoring"
+SM_ON=(--set serviceMonitor.enabled=true
+  --set-string "serviceMonitor.labels.$SM_LABEL_KEY=$SM_LABEL_VALUE"
+  --set-string "serviceMonitor.interval=$SM_INTERVAL"
+  --set-string "networkPolicy.monitoring.namespace=$SM_NAMESPACE")
+# kubeconform's default schema source does not have the ServiceMonitor CRD, so
+# its schema is vendored in the repo, with its source and commit noted in
+# scripts/schemas/monitoring.coreos.com/SOURCE.txt. The path is relative to the
+# repo root.
+SCHEMAS_DIR="scripts/schemas"
+
 for tool in helm kubeconform yq; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     printf 'error: %s is not on PATH\n' "$tool" >&2
@@ -44,6 +64,7 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 rendered="$tmp_dir/dev.yaml"
 tls_rendered="$tmp_dir/dev-tls.yaml"
+sm_rendered="$tmp_dir/dev-servicemonitor.yaml"
 
 failures=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -80,6 +101,19 @@ else
   exit 1
 fi
 
+if helm lint --strict "$CHART_DIR" -f "$DEV_VALUES" "${SM_ON[@]}"; then
+  pass "helm lint --strict with the ServiceMonitor on"
+else
+  fail "helm lint --strict with the ServiceMonitor on"
+fi
+
+if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" "${SM_ON[@]}" >"$sm_rendered"; then
+  pass "render with the dev values and the ServiceMonitor on"
+else
+  fail "render with the dev values and the ServiceMonitor on"
+  exit 1
+fi
+
 # With no issuer, cert-manager would ignore the Ingress and no certificate
 # would ever arrive, so the chart must refuse to render instead.
 if render_error="$(helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" --set ingress.tls.enabled=true 2>&1 >/dev/null)"; then
@@ -90,10 +124,17 @@ else
   pass "Ingress TLS on without a ClusterIssuer does not render"
 fi
 
-if kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" "$rendered" "$tls_rendered"; then
-  pass "kubeconform -strict against Kubernetes $KUBERNETES_VERSION, Ingress TLS off and on"
+# The ServiceMonitor render holds a kind the Kubernetes schemas do not know, so
+# the vendored CRD schema covers it. Run from the repo root, because the schema
+# location is a relative path.
+kubeconform_label="kubeconform -strict against Kubernetes $KUBERNETES_VERSION and the vendored ServiceMonitor schema, Ingress TLS off and on, ServiceMonitor on"
+if (cd "$REPO_ROOT" && kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
+  -schema-location default \
+  -schema-location "$SCHEMAS_DIR/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" \
+  "$rendered" "$tls_rendered" "$sm_rendered"); then
+  pass "$kubeconform_label"
 else
-  fail "kubeconform -strict against Kubernetes $KUBERNETES_VERSION, Ingress TLS off and on"
+  fail "$kubeconform_label"
 fi
 
 # What the rendered dev manifests must say. The expected values come from the
@@ -530,6 +571,62 @@ expect "TLS on: TLS secret name is set" "set" \
 # controller, so ADR-0002 still holds.
 expect "TLS on: Ingress annotations" "cert-manager.io/cluster-issuer=$TLS_ISSUER" \
   "$(q_tls "[$ingress | .metadata.annotations // {} | to_entries | .[] | .key + \"=\" + .value] | join(\" \")")"
+
+# The ServiceMonitor (serviceMonitor.enabled), off by default, so the cluster
+# needs no monitoring CRDs. Off, nothing changes: no ServiceMonitor, and the
+# NetworkPolicy keeps its one peer, Traefik.
+servicemonitor='select(.kind == "ServiceMonitor")'
+expect "ServiceMonitor off: no ServiceMonitor" "0" "$(q "[$servicemonitor] | length")"
+expect "ServiceMonitor off: the NetworkPolicy has one peer" "1" "$(q "[$np_rule | .from[]] | length")"
+
+# On, the ServiceMonitor tells a Prometheus Operator to scrape /metrics on the
+# Service's named port, and the NetworkPolicy admits the monitoring namespace
+# as a second peer on the same container port.
+q_sm() { qf "$sm_rendered" "$1"; }
+expect "ServiceMonitor on: one ServiceMonitor" "1" "$(q_sm "[$servicemonitor] | length")"
+expect "ServiceMonitor on: apiVersion" "monitoring.coreos.com/v1" "$(q_sm "$servicemonitor | .apiVersion")"
+expect "ServiceMonitor on: one endpoint" "1" "$(q_sm "[$servicemonitor | .spec.endpoints[]] | length")"
+expect "ServiceMonitor on: scrapes /metrics" "/metrics" "$(q_sm "$servicemonitor | .spec.endpoints[0].path")"
+expect "ServiceMonitor on: scrapes the Service's named port" "$(q "$service | .spec.ports[0].name")" \
+  "$(q_sm "$servicemonitor | .spec.endpoints[0].port")"
+expect "ServiceMonitor on: scrape interval comes from the values" "$SM_INTERVAL" \
+  "$(q_sm "$servicemonitor | .spec.endpoints[0].interval")"
+expect "ServiceMonitor on: extra label comes from the values" "$SM_LABEL_VALUE" \
+  "$(q_sm "$servicemonitor | .metadata.labels.\"$SM_LABEL_KEY\"")"
+# The selector must match the Service's labels and pin this release, or it
+# would also scrape other releases' Services.
+sm_selector="$(q_sm "$servicemonitor | .spec.selector.matchLabels | to_entries | .[] | .key + \"=\" + .value" | sort)"
+service_labels="$(q "$service | .metadata.labels | to_entries | .[] | .key + \"=\" + .value" | sort)"
+unmatched="$(comm -23 <(printf '%s\n' "$sm_selector") <(printf '%s\n' "$service_labels"))"
+expect "ServiceMonitor on: selects the Service" "selects" \
+  "$([[ -n "$sm_selector" && -z "$unmatched" ]] && echo selects || echo "selector '${sm_selector//$'\n'/,}' not on the Service")"
+expect "ServiceMonitor on: selector pins the release" "app.kubernetes.io/instance=$RELEASE" \
+  "$(printf '%s\n' "$sm_selector" | grep '^app.kubernetes.io/instance=' || true)"
+expect "ServiceMonitor on: the NetworkPolicy has two peers" "2" "$(q_sm "[$networkpolicy | .spec.ingress[0].from[]] | length")"
+expect "ServiceMonitor on: the first peer is still Traefik" "$TRAEFIK_PEER" \
+  "$(q_sm "[$networkpolicy | .spec.ingress[0].from[0]] | sort_keys(..) | to_json(0)")"
+MONITORING_PEER="[{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"$SM_NAMESPACE\"}}}]"
+expect "ServiceMonitor on: the second peer is the monitoring namespace" "$MONITORING_PEER" \
+  "$(q_sm "[$networkpolicy | .spec.ingress[0].from[1]] | sort_keys(..) | to_json(0)")"
+expect "ServiceMonitor on: the NetworkPolicy still admits one port" "1" "$(q_sm "[$networkpolicy | .spec.ingress[0].ports[]] | length")"
+expect "ServiceMonitor on: the NetworkPolicy port is the container port" "$CONTAINER_PORT" \
+  "$(container_port_number "$(q_sm "$networkpolicy | .spec.ingress[0].ports[0].port")" "$sm_rendered")"
+
+# The flag adds the ServiceMonitor and the second peer, nothing else: without
+# them, the render is the default one, object for object.
+without_sm='select(.kind != "ServiceMonitor") | with(select(.kind == "NetworkPolicy"); del(.spec.ingress[0].from[1]))'
+sm_diff="$(diff <(yq "$without_sm" "$rendered") <(yq "$without_sm" "$sm_rendered") || true)"
+expect "ServiceMonitor on: only the ServiceMonitor and the monitoring peer are added" "no other change" \
+  "$([[ -z "$sm_diff" ]] && echo "no other change" || echo "${sm_diff//$'\n'/ | }")"
+
+# With the namespace values left at their defaults.
+if render_with sm-defaults --set serviceMonitor.enabled=true; then
+  variant="$tmp_dir/sm-defaults.yaml"
+  expect "ServiceMonitor on, default values: scrape interval" "30s" \
+    "$(qf "$variant" "$servicemonitor | .spec.endpoints[0].interval")"
+  expect "ServiceMonitor on, default values: monitoring namespace" "monitoring" \
+    "$(qf "$variant" "$networkpolicy | .spec.ingress[0].from[1].namespaceSelector.matchLabels.\"kubernetes.io/metadata.name\"")"
+fi
 
 # Standard app.kubernetes.io labels, on every object and on the pods. The outer
 # parentheses matter: in yq, `or` binds looser than `|`.

@@ -189,7 +189,8 @@ gitops/charts/sample-nodejs/
     ├── serviceaccount.yaml
     ├── service.yaml
     ├── ingress.yaml
-    └── networkpolicy.yaml
+    ├── networkpolicy.yaml
+    └── servicemonitor.yaml  # only with serviceMonitor.enabled
 ```
 
 What it renders:
@@ -205,6 +206,7 @@ What it renders:
 - **Ingress.** `ingressClassName: traefik` and no controller-specific annotations ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)), so the controller can be replaced without a chart change. The host comes from the Environment's values. There is one `Prefix` rule per Public path, `/my-app` and `/about`, and nothing else. `/classified`, `/metrics`, `/ready` and `/live` have no route, so from outside the cluster they get the controller's 404.
 - **Ingress TLS, off by default.** `ingress.tls.enabled: true` gives the Ingress a TLS section for the host, naming the secret `<object name>-tls` (`sample-nodejs-dev-tls` in dev), and one annotation, `cert-manager.io/cluster-issuer`, set from `ingress.tls.clusterIssuer`. cert-manager sees the annotation, has that ClusterIssuer sign a certificate for the host, and keeps it in the secret, where Traefik picks it up. The annotation is read by cert-manager, not by the Ingress controller, so the Ingress still has no controller-specific annotations. With the flag on and no issuer set, the chart refuses to render. See [HTTPS: Let's Encrypt in production, self-signed here](#https-lets-encrypt-in-production-self-signed-here).
 - **NetworkPolicy.** It selects the app's pods and admits traffic only on the container port (`http`, 8080), and only from Traefik's pods (`app.kubernetes.io/name: traefik`) in the `traefik` namespace, matched by the `kubernetes.io/metadata.name` label that Kubernetes sets on every namespace. Both selectors sit in one peer, so a pod must match both; as two peers they would admit any pod in the `traefik` namespace, or any pod with Traefik's labels in the app's namespace. Every other pod in the cluster, in any namespace including the app's own, cannot open a connection to the app, so `/classified` and `/metrics` stay out of its reach. The policy names the container port, not the Service's port 80, because it sees traffic after the Service has forwarded it to the pod. Egress is not restricted. The controller's namespace and pod labels come from `networkPolicy.ingressController` in the values. A NetworkPolicy is only enforced by a CNI plugin that implements it, which is why Bootstrap starts minikube with Calico. See [NetworkPolicy on the cluster](#networkpolicy-on-the-cluster).
+- **ServiceMonitor, off by default.** `serviceMonitor.enabled: true` renders a `monitoring.coreos.com/v1` ServiceMonitor that scrapes `/metrics` on the Service's port `http`, every `serviceMonitor.interval` (30s), and adds the `monitoring` namespace (`networkPolicy.monitoring.namespace`) as a second peer of the NetworkPolicy, on the same container port. Off, the chart renders no ServiceMonitor and the NetworkPolicy admits only Traefik, so the cluster needs no monitoring CRDs. See [Turning monitoring on](#turning-monitoring-on).
 - **Labels.** Every object and every pod carries `app.kubernetes.io/name`, `instance`, `version` (the image tag) and `managed-by`, plus Helm's `helm.sh/chart`. The Deployment selector uses only `name` and `instance`, which never change for a release, because a selector cannot be changed after creation.
 
 ### Why a Deployment, not a StatefulSet
@@ -240,7 +242,7 @@ The two original pods kept the load (242m and 142m at the end) while the three n
 
 ### Values and Environments
 
-- `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the HPA (`autoscaling`) and the PodDisruptionBudget (`podDisruptionBudget`), the name of the registry pull secret, the Ingress class, the list of Public paths, the Ingress TLS flag, off, and the Ingress controller that the NetworkPolicy admits (namespace `traefik`, pods labeled `app.kubernetes.io/name: traefik`). An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
+- `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the HPA (`autoscaling`) and the PodDisruptionBudget (`podDisruptionBudget`), the name of the registry pull secret, the Ingress class, the list of Public paths, the Ingress TLS flag, off, the Ingress controller that the NetworkPolicy admits (namespace `traefik`, pods labeled `app.kubernetes.io/name: traefik`), and the ServiceMonitor flag, off, with its scrape interval, its labels and the monitoring namespace the NetworkPolicy admits when it is on. An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
 - `values-dev.yaml` holds what the dev Environment adds: the image repository `ghcr.io/sela27/sample-nodejs`, the image tag, and the host `sample-nodejs.127.0.0.1.nip.io`. nip.io resolves that name to 127.0.0.1, where `minikube tunnel` exposes Traefik, so no hosts-file edit is needed.
 - The chart refuses to render without an image repository, an image tag, a host and a pull secret name, or with Ingress TLS on and no ClusterIssuer, so a missing value fails at render time, not in the cluster.
 - The dev image tag is a Release version, `1.0.0` at first, seeded by hand. From then on the [Bump commit](#bump-commit) is the only writer of `image.tag` in `values-dev.yaml`, and it always writes a Release version. No manifest uses `latest`.
@@ -256,16 +258,39 @@ Let's Encrypt only signs for a name once it has checked, from the internet, that
 
 So the local setup would use a self-signed ClusterIssuer: cert-manager signs the certificate itself, with no outside party involved. The traffic is encrypted all the same, but no trusted CA vouches for the certificate, so the browser shows a warning. The flag stays off in `dev` until cert-manager runs in the cluster, because without it nothing would issue the certificate.
 
+### Turning monitoring on
+
+The app serves Prometheus text on `/metrics`, including `root_access_total`. The Ingress does not route that path, so Prometheus has to reach the Service from inside the cluster, and the NetworkPolicy has to let it in. One flag does both:
+
+1. Install a Prometheus Operator that provides the `ServiceMonitor` CRD, such as kube-prometheus-stack. The flag stays off until the CRD exists, because a ServiceMonitor cannot be applied without it.
+2. In the Environment's values file, set:
+
+   ```yaml
+   serviceMonitor:
+     enabled: true
+     labels:
+       release: kube-prometheus-stack   # the label that Prometheus's serviceMonitorSelector matches
+   networkPolicy:
+     monitoring:
+       namespace: monitoring            # the namespace Prometheus runs in
+   ```
+
+   `serviceMonitor.interval` (default `30s`) sets the scrape interval. `serviceMonitor.labels` is empty by default, and Prometheus ignores a ServiceMonitor its selector does not match: kube-prometheus-stack selects on its Helm release name by default, so the label's value is the name of that release.
+3. Merge it. ArgoCD syncs the ServiceMonitor and the wider NetworkPolicy together. The ServiceMonitor selects the Service by the chart's name and instance labels, in its own namespace, so it scrapes only this release.
+
+The NetworkPolicy admits every pod in the monitoring namespace, matched by the `kubernetes.io/metadata.name` label, not only the Prometheus pod: the pod's labels depend on how Prometheus was installed. Nothing but monitoring should run in that namespace.
+
 ### Chart check
 
 `scripts/check-chart.sh` is the `chart` check, and runs the same way locally and in CI:
 
 1. `helm lint --strict` with the dev values, and again with Ingress TLS on. Warnings fail too.
 2. `helm template` with the dev values, and again with Ingress TLS on (`ingress.tls.enabled=true` and a test ClusterIssuer name). A third render, with TLS on and no issuer, must fail.
-3. kubeconform in strict mode, over both renders, against the schemas of Kubernetes 1.35.1, the version Bootstrap runs. Strict mode also rejects unknown fields, such as a misspelled `containerPorts`, and duplicate keys, which Kubernetes would otherwise drop without a word.
+3. kubeconform in strict mode, over the three renders (default, TLS on, ServiceMonitor on), against the schemas of Kubernetes 1.35.1, the version Bootstrap runs. Strict mode also rejects unknown fields, such as a misspelled `containerPorts`, and duplicate keys, which Kubernetes would otherwise drop without a word.
 4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik`, no annotations, no TLS section and the dev host; the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; one NetworkPolicy selects the app's pods, restricts ingress only, admits one TCP port, the container port, and admits exactly one peer, Traefik's pods in the namespace that `gitops/apps/traefik.yaml` deploys Traefik into; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
 5. Assertions on the TLS-on render: the Ingress has one TLS entry, for the dev host, that names a secret; its only annotation is `cert-manager.io/cluster-issuer`, set to the issuer the check passed in; and with those two taken out, the render is the same as the default one, object for object, so the flag changes nothing else.
-6. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes, the Service's target and the NetworkPolicy's port together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
+6. Assertions on the ServiceMonitor-on render, with a scrape interval, a label and a namespace that differ from the defaults, so the values show up in the objects: one `monitoring.coreos.com/v1` ServiceMonitor with one endpoint, path `/metrics`, on the Service's port name, with that interval and label, selecting the Service by its labels and pinning the release; the NetworkPolicy has two peers, Traefik's first and unchanged, then the monitoring namespace, on the one container port; and with the ServiceMonitor and that peer taken out, the render is the default one, object for object. The default render has no ServiceMonitor and one peer. The default values give `30s` and the `monitoring` namespace.
+7. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes, the Service's target and the NetworkPolicy's port together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
 
 Each failure prints what was expected and what the chart rendered. If the dev values added `/classified` to the Public paths, for example, the check fails with `expected: /about /my-app | got: /about /classified /my-app`.
 

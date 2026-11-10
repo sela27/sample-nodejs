@@ -55,10 +55,12 @@ jobs:
           failure-threshold: warning
 
   # Helm chart: helm lint, then the chart rendered with the dev values, with
-  # Ingress TLS off and on, is validated against the Kubernetes schemas
+  # Ingress TLS off and on and with the ServiceMonitor on, is validated against the Kubernetes schemas
   # (kubeconform, strict) and checked for what it must promise (Public paths
   # only, probes, ports, pod hardening, ServiceAccount, app configuration and
-  # its rollout checksum, labels, the TLS flag).
+  # its rollout checksum, labels, the TLS and ServiceMonitor flags). The
+  # ServiceMonitor is validated against its CRD schema, vendored in
+  # scripts/schemas, so the job downloads no schema.
   # scripts/check-chart.sh holds the checks, so a local run matches this job.
   chart:
     runs-on: ubuntu-24.04
