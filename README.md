@@ -10,6 +10,7 @@ A lightweight Node.js application. It features basic web endpoints, Prometheus m
 - Prometheus metrics integration
 - Readiness and liveness probe endpoints
 - Customizable port via environment variable
+- Graceful shutdown on SIGTERM and SIGINT
 
 ## Prerequisites
 
@@ -106,10 +107,27 @@ npm test
 `npm test` runs Node's built-in test runner (`node --test`) over the `test/` directory. The tests drive the app through real HTTP requests, the same way a client does:
 
 - `test/app.test.js` sends requests with supertest to the exported Express app in-process. It checks the status and body of `/my-app`, `/about`, `/ready`, `/live` and `/classified`, a 404 for an unknown path, and the `/metrics` contract: Prometheus content type, `root_access_total` present, and its value going up by one after a request to `/my-app`.
-- `test/entrypoint.test.js` checks that loading `app.js` does not open a port, and that `node app.js` listens on `PORT` (default 8080) and prints `Server running on port <PORT>`.
+- `test/entrypoint.test.js` checks that loading `app.js` does not open a port, and that `node app.js` listens on `PORT` (default 8080) and prints `Server running on port <PORT>`. Its [graceful shutdown](#graceful-shutdown) tests start `node app.js` as a child process. They check that it exits 0 on SIGTERM and on SIGINT, that a request in flight when SIGTERM arrives still gets its answer while new connections are refused, and that `SHUTDOWN_TIMEOUT_MS` forces exit 1 when a request never finishes. Windows does not deliver POSIX signals to a child process, so these tests are skipped there. CI runs them on Linux.
 - `test/bump-dev-image-tag.test.js` runs `scripts/bump-dev-image-tag.sh` with bash against a copy of the dev values ([Bump commit](#bump-commit)). On Windows, run `npm test` from Git Bash.
 
 supertest is a dev dependency only; the app does not need it at runtime.
+
+## Graceful shutdown
+
+On SIGTERM, which Kubernetes and `docker stop` send, or SIGINT (Ctrl+C), `node app.js`:
+
+1. Stops accepting new connections.
+2. Lets requests already in flight finish. It answers them with `Connection: close`, so a keep-alive client such as the ingress controller's connection pool cannot hold the shutdown open.
+3. Exits 0 once the server has closed.
+
+If connections are still open after `SHUTDOWN_TIMEOUT_MS` milliseconds (default `10000`), the app logs that on stderr and exits 1. The kubelet sends SIGKILL when the pod's termination grace period runs out, so the timeout must stay shorter than that grace period minus any preStop pause. The chart keeps the Kubernetes default grace period of 30 seconds.
+
+Before this, the container ignored SIGTERM altogether. Node runs as PID 1 in the container, and the kernel does not apply a signal's default action to PID 1, so a process without a handler never ends on SIGTERM. `docker stop` waited out its timeout and then killed it. Timed with `docker stop -t 10` on the hardened container from [Container image](#container-image) (Docker Desktop 29.6.1, 2026-11-10):
+
+| Image | `docker stop` took | Exit code |
+| --- | --- | --- |
+| Before (no handler) | 10.66 s | 137 (SIGKILL) |
+| Now | 0.58 s | 0 |
 
 ## Container image
 
