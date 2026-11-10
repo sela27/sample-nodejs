@@ -18,13 +18,24 @@ A lightweight Node.js application. It features basic web endpoints, Prometheus m
 
 ## Quick start
 
-One command brings up a local cluster in which ArgoCD manages everything else from git. You need Docker (Docker Desktop on Windows and macOS), minikube, kubectl and Helm. The script runs from Git Bash on Windows and from bash on Linux and macOS.
+One command brings up a local cluster in which ArgoCD manages everything else from git, and Deploys the app to the `dev` Environment. You need Docker (Docker Desktop on Windows and macOS), minikube, kubectl and Helm. The script runs from Git Bash on Windows and from bash on Linux and macOS.
+
+The image `ghcr.io/sela27/sample-nodejs` is a private package, so the cluster needs a token to pull it. Create a classic personal access token with only the `read:packages` scope (GitHub, Settings, Developer settings, Personal access tokens, Tokens (classic)). Then read it into `GHCR_PULL_TOKEN` without echo, so it stays out of your shell history, and run the script:
 
 ```bash
+read -rs GHCR_PULL_TOKEN   # paste the token, then press Enter
+export GHCR_PULL_TOKEN
 scripts/bootstrap.sh
 ```
 
-The script starts minikube with the Calico CNI (so NetworkPolicies are enforced) and the metrics-server addon, installs ArgoCD from its pinned Helm chart, and applies the root Application (`gitops/bootstrap/root-app.yaml`). ArgoCD then installs everything declared under `gitops/apps` on `main`. For now that is the Traefik ingress controller ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)). Re-running the script is safe, because it reuses a running cluster and upgrades ArgoCD in place. It ends by printing how to read the ArgoCD admin password and how to open the ArgoCD UI.
+Without the token, the script stops at once with a message saying what to set, before it changes anything.
+
+The script starts minikube with the Calico CNI (so NetworkPolicies are enforced) and the metrics-server addon, and installs ArgoCD from its pinned Helm chart. It creates the app namespace `sample-nodejs-dev` with the [restricted Pod Security](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted) labels (`enforce`, `audit` and `warn`), and in it the registry pull secret `ghcr-pull` from the token. That secret is the one object in the cluster that does not come from git ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)). The script never prints the token, not even under `bash -x`, and passes it to kubectl on stdin, so it does not show in the process list either. Then it applies the root Application (`gitops/bootstrap/root-app.yaml`), and ArgoCD installs everything declared under `gitops/apps` on `main`:
+
+- `traefik.yaml`: the Traefik ingress controller ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)).
+- `sample-nodejs-dev.yaml`: the app, from our chart with `values-dev.yaml`, in the `sample-nodejs-dev` namespace. It syncs automatically with prune and self-heal, so each [Bump commit](#bump-commit) on `main` is Deployed with no manual step.
+
+The script waits until the app's Application is Synced and its pods pass the readiness probe. Re-running it is safe, because it reuses a running cluster, upgrades ArgoCD in place and updates the namespace and the pull secret in place. To rotate the token, re-run it with the new one. It ends by printing how to read the ArgoCD admin password, how to open the ArgoCD UI, and the app URL.
 
 Then start the tunnel in a separate terminal and leave it running. It may ask for admin rights, because it binds ports 80 and 443 on localhost:
 
@@ -32,10 +43,14 @@ Then start the tunnel in a separate terminal and leave it running. It may ask fo
 minikube tunnel
 ```
 
-With the tunnel up, `http://sample-nodejs.127.0.0.1.nip.io/` answers with Traefik's own `404 page not found`, because no app route exists yet. `scripts/verify-bootstrap.sh` checks the whole setup and prints PASS, FAIL or SKIP for each check. The tunnel check runs only while the tunnel is up.
+With the tunnel up, open the app in the browser at [http://sample-nodejs.127.0.0.1.nip.io/my-app](http://sample-nodejs.127.0.0.1.nip.io/my-app). It answers `Hello, World!`. Only the Public paths `/my-app` and `/about` have a route, so `/` and every other path get Traefik's own `404 page not found`. The tunnel also turns both Applications Healthy in ArgoCD. Until then they show Progressing: ArgoCD rates a LoadBalancer Service and an Ingress Progressing until they have an address, and the tunnel gives Traefik's Service one, which Traefik copies onto the app's Ingress.
+
+`scripts/verify-bootstrap.sh` checks the whole setup and prints PASS, FAIL or SKIP for each check: the cluster, ArgoCD, Traefik, the namespace labels, the pull secret, the app's Application (source, sync policy, Synced, Healthy or waiting for the tunnel), that the app process runs as uid 1000, and `/my-app` through Traefik. The tunnel checks run only while the tunnel is up; the other HTTP checks go through a port-forward.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `GHCR_PULL_TOKEN` | none, required | Classic personal access token with only `read:packages`, stored as the pull secret `ghcr-pull` |
+| `GHCR_PULL_USER` | `sela27` | GitHub user the token belongs to |
 | `MINIKUBE_PROFILE` | `minikube` | minikube profile and kubectl context |
 | `MINIKUBE_CPUS` | `4` | CPUs for the minikube node |
 | `MINIKUBE_MEMORY` | `4096` | Memory for the minikube node, in MiB |
@@ -283,6 +298,23 @@ KSV-0014 (HIGH): Container 'app' of Deployment 'sample-nodejs-dev' should set 's
 - `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
 - A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
 
+**An SBOM on every Release.** Each GitHub Release carries `sample-nodejs-<version>.cdx.json`, a CycloneDX JSON SBOM (software bill of materials) of the image it released. It lists every package in the image, the Alpine packages and the app's npm dependencies, each with its version and package URL. The release run makes it like this:
+
+1. After the push, the `image` job reads the digest of `ghcr.io/sela27/sample-nodejs:<version>` back from GHCR with `docker buildx imagetools inspect`, so it is the digest the registry serves, not one taken from the runner's Docker engine.
+2. The same pinned Trivy 0.76.2 as the image Gate reads the image at that digest from GHCR (`--image-src remote`, not the local copy) and writes the SBOM (`--format cyclonedx`). The SBOM therefore describes exactly the image the cluster pulls. It names that digest in its metadata, in the `aquasecurity:trivy:RepoDigest` property, and the job fails if the SBOM has no components or names another image.
+3. The file goes to the `release` job as a workflow artifact, and `@semantic-release/github` uploads it to the GitHub Release, through the `assets` entry in `.releaserc.yaml`. The plugin only logs a warning when an asset file is missing, and still creates the Release, so the job then downloads the asset back from the Release and compares it byte for byte with the file it uploaded. A Release without its SBOM turns the run red.
+
+Trivy makes the SBOM rather than a second tool such as Syft because it is already in the job, pinned and checked against its SHA-256, so there is nothing new to pin or trust. The SBOM holds the inventory only, no vulnerabilities: a vulnerability list would be out of date within days. Instead, the SBOM lets anyone scan a released image again against today's vulnerability database without pulling it from the private package. To check the SBOM of a Release (`v1.0.0` predates the SBOM and has none):
+
+```bash
+v=1.1.0
+gh release download "v$v" --repo sela27/sample-nodejs --pattern "sample-nodejs-$v.cdx.json"
+docker run --rm -v "$PWD:/sbom:ro" cyclonedx/cyclonedx-cli:0.33.1 \
+  validate --input-file "/sbom/sample-nodejs-$v.cdx.json" --input-format json --fail-on-errors
+jq -r '.metadata.component.properties[] | select(.name == "aquasecurity:trivy:RepoDigest").value' "sample-nodejs-$v.cdx.json"
+trivy sbom --severity HIGH,CRITICAL "sample-nodejs-$v.cdx.json"   # the image's vulnerabilities as of today
+```
+
 ### Dependabot
 
 `.github/dependabot.yml` has Dependabot look for version updates once a week, on Monday, wherever this repo pins a dependency. Its PRs are ordinary PRs to `main`: they run every required check and merge only when all of them pass, so an update that breaks a test, the chart or the image Gate cannot land.
@@ -333,8 +365,8 @@ The first Release is 1.0.0, whatever the type. Only changes to the app or its pr
 The run has four jobs. Each one starts only if the one before it succeeded:
 
 1. **`version`** runs semantic-release in dry-run mode (`release/next-version.mjs`). It reads the commits since the last `v*` tag, logs a verdict for each commit and the release notes it would publish, and creates nothing. If no commit warrants a Release, it logs `No Release from this commit`, and the run ends there, green, with the other three jobs skipped.
-2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge. After the push, it signs the image's digest with cosign and attaches a build provenance attestation to it ([Image signature and provenance](#image-signature-and-provenance)).
-3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes. A last step checks that the tag exists. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
+2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge. After the push, it reads the pushed digest back from GHCR, signs that digest with cosign and attaches a build provenance attestation to it ([Image signature and provenance](#image-signature-and-provenance)). Last, it generates the CycloneDX SBOM of the image at that digest ([An SBOM on every Release](#supply-chain-and-permissions)).
+3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes and the SBOM as an asset. Two last steps check that the tag exists and that the Release carries the SBOM. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
 4. **`bump`** makes the [Bump commit](#bump-commit): it sets the dev image tag to the version and pushes that one-line change to `main` with the deploy key. ArgoCD deploys it from there.
 
 **A Gate failure leaves nothing behind.** When the scan fails, the `image` job stops at that step. Its login and push steps show as skipped, so nothing reaches GHCR. The `release` and `bump` jobs are skipped as well, so no tag, no GitHub Release and no Bump commit are created. The job order guarantees this. The job that creates the tag starts only after the job that pushes, and that job pushes only after the scan passes.
@@ -344,8 +376,8 @@ The run has four jobs. Each one starts only if the one before it succeeded:
 | Job | Token permissions | Why |
 | --- | --- | --- |
 | `version` | `contents: write` | Before it analyzes anything, semantic-release checks with `git push --dry-run` that it could push the tag, even in dry-run mode. GitHub refuses that check to a read-only token. The job pushes nothing. |
-| `image` | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` | Push the image, its signature and its attestation to GHCR. Request the GitHub OIDC token that cosign and `actions/attest` exchange for a short-lived signing certificate. Store the attestation through the GitHub attestations API. |
-| `release` | `contents: write` | Push the tag and create the GitHub Release. |
+| `image` | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` | Push the image, its signature and its attestation to GHCR, and read the image back from there for the SBOM. Request the GitHub OIDC token that cosign and `actions/attest` exchange for a short-lived signing certificate. Store the attestation through the GitHub attestations API. |
+| `release` | `contents: write` | Push the tag, create the GitHub Release and upload the SBOM to it. |
 | `bump` | none | The repo is public, so the checkout needs no token, and the push uses the deploy key. |
 
 **One run at a time.** All release runs share one concurrency group, and a run in progress is never cancelled, because a cancelled run could leave an image in GHCR without its Release. A push that lands meanwhile waits. GitHub keeps only the newest waiting run and cancels older waiting ones. That loses nothing, because semantic-release reads every commit since the last Release tag, so the newest run releases them all. The Bump commit carries `[skip ci]`, so GitHub starts no run for it.
@@ -354,7 +386,7 @@ The run has four jobs. Each one starts only if the one before it succeeded:
 
 - The release branch is `main`, and tags are `v${version}`.
 - The commit analyzer and the release notes generator use the `conventionalcommits` preset. The notes list features, bug fixes, performance improvements and reverts, and leave out `ci`, `docs`, `chore`, `build`, `test`, `refactor` and `style` commits.
-- The GitHub plugin creates the GitHub Release. It is set not to comment on the released PRs and not to open an issue when a release fails, because both would need write access to issues and pull requests.
+- The GitHub plugin creates the GitHub Release. It is set not to comment on the released PRs and not to open an issue when a release fails, because both would need write access to issues and pull requests. Its one asset is the SBOM, `sbom/sample-nodejs-*.cdx.json`, which the `release` job downloads from the `image` job before semantic-release runs.
 - There is no npm plugin, so nothing is published to the npm registry, and no git plugin, so nothing is committed back. The git tag is the source of truth for the version. `package.json` keeps its `version` field as it is, and there is no `CHANGELOG.md`, because the notes live in the GitHub Release.
 
 **Pinned release tooling.** `release/package.json` pins semantic-release 25.0.9 and `conventional-changelog-conventionalcommits` 9.3.1 exactly, and `release/package-lock.json` pins every package below them, with its integrity hash. Both semantic-release jobs install it with `npm ci --ignore-scripts` and no dependency cache. It is a separate manifest, rather than root dev dependencies or `npx`:
@@ -390,7 +422,7 @@ Run it only on `main`. On any other branch, semantic-release force-updates the l
 
 From 1.1.0 on, every image the release run pushes is signed and carries a build provenance attestation. Both are keyless: no signing key exists, so there is none to leak, store as a secret or rotate. The `image` job does it right after the push:
 
-1. It reads the digest of the pushed image, which both tags point at. The signature and the attestation name that digest, never a tag, because a tag can later be moved to another image.
+1. It reads the digest of the pushed image back from GHCR, the one both tags point at. The signature, the attestation and the SBOM name that digest, never a tag, because a tag can later be moved to another image.
 2. cosign 3.1.4 signs the digest. It exchanges the job's GitHub OIDC token for a certificate from Fulcio, Sigstore's certificate authority, valid for ten minutes. The certificate names the workflow that asked for it, `https://github.com/sela27/sample-nodejs/.github/workflows/release.yml@refs/heads/main`, and the token's issuer, `https://token.actions.githubusercontent.com`. The signature is recorded in Rekor, Sigstore's public transparency log, and stored in GHCR next to the image.
 3. `actions/attest` creates a [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance) attestation for the same digest: the repo, workflow, commit and run that built it, signed the same keyless way. It is stored through the GitHub attestations API and pushed to GHCR next to the image.
 
@@ -488,7 +520,8 @@ Each security control in the delivery path, where it is enforced, and what it st
 | All Linux capabilities dropped | Container `capabilities.drop: [ALL]` | The process holding or regaining kernel privileges, such as opening raw sockets, changing file ownership or bypassing file permissions. |
 | `RuntimeDefault` seccomp profile | Pod `seccompProfile` | System calls outside the container runtime's default allowlist, which shrinks the kernel surface an exploit can reach. |
 | No Kubernetes API token | ServiceAccount and pod `automountServiceAccountToken: false` | A compromised pod using an API token to read or change cluster objects. |
-| Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)) | The `read:packages` token reaching the repo. |
+| Restricted Pod Security admission | Labels `pod-security.kubernetes.io/enforce`, `audit` and `warn` set to `restricted` on the `sample-nodejs-dev` namespace by Bootstrap | Any pod in the app namespace that breaks the restricted profile, whatever its chart says: the API server refuses to create it. |
+| Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)), which never prints the token | The `read:packages` token reaching the repo or a log. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
