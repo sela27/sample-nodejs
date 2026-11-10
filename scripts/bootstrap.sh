@@ -201,15 +201,18 @@ apply_root_app() {
 }
 
 # The Traefik Application stays Progressing until `minikube tunnel` gives its
-# LoadBalancer Service an address, so Bootstrap waits for Synced and a running
-# Traefik rather than for Healthy. The app's Application is Healthy once its
-# pods pass the readiness probe, which needs the image pulled with the token.
+# LoadBalancer Service an address, and so does the app's, because Traefik
+# copies that address onto the app's Ingress. So Bootstrap waits for each to
+# be Synced and its Deployment available rather than for Healthy. The app's
+# Deployment is available once its pods pass the readiness probe, which needs
+# the image pulled with the token.
 wait_for_applications() {
   log "Waiting for ArgoCD to sync the Applications from git"
   wait_until 300 "the root Application to be Synced and Healthy" app_synced_and_healthy root
   wait_until 300 "the traefik Application to be Synced" app_synced traefik
   wait_until 300 "Traefik to be available" deployment_available traefik traefik
-  wait_until 300 "the ${APP} Application to be Synced and Healthy" app_synced_and_healthy "$APP"
+  wait_until 300 "the ${APP} Application to be Synced" app_synced "$APP"
+  wait_until 300 "the app to be available" deployment_available "$APP_NAMESPACE" "$APP"
 }
 
 print_next_steps() {
@@ -230,7 +233,8 @@ Ingress on localhost: in a separate terminal, run this and keep it running
 (it may ask for admin rights, because it binds ports 80 and 443):
   minikube tunnel -p ${MINIKUBE_PROFILE}
 
-With the tunnel up, the app answers "Hello, World!" in the browser at:
+With the tunnel up, the app answers "Hello, World!" in the browser at the URL
+below, and ArgoCD shows both Applications Healthy:
   http://${APP_HOST}/my-app
 
 Check the cluster state at any time (the tunnel checks run while the tunnel is up):

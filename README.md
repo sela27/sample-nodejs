@@ -35,7 +35,7 @@ The script starts minikube with the Calico CNI (so NetworkPolicies are enforced)
 - `traefik.yaml`: the Traefik ingress controller ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)).
 - `sample-nodejs-dev.yaml`: the app, from our chart with `values-dev.yaml`, in the `sample-nodejs-dev` namespace. It syncs automatically with prune and self-heal, so each [Bump commit](#bump-commit) on `main` is Deployed with no manual step.
 
-The script waits until the app's Application is Synced and Healthy. Re-running it is safe, because it reuses a running cluster, upgrades ArgoCD in place and updates the namespace and the pull secret in place. To rotate the token, re-run it with the new one. It ends by printing how to read the ArgoCD admin password, how to open the ArgoCD UI, and the app URL.
+The script waits until the app's Application is Synced and its pods pass the readiness probe. Re-running it is safe, because it reuses a running cluster, upgrades ArgoCD in place and updates the namespace and the pull secret in place. To rotate the token, re-run it with the new one. It ends by printing how to read the ArgoCD admin password, how to open the ArgoCD UI, and the app URL.
 
 Then start the tunnel in a separate terminal and leave it running. It may ask for admin rights, because it binds ports 80 and 443 on localhost:
 
@@ -43,9 +43,9 @@ Then start the tunnel in a separate terminal and leave it running. It may ask fo
 minikube tunnel
 ```
 
-With the tunnel up, open the app in the browser at [http://sample-nodejs.127.0.0.1.nip.io/my-app](http://sample-nodejs.127.0.0.1.nip.io/my-app). It answers `Hello, World!`. Only the Public paths `/my-app` and `/about` have a route, so `/` and every other path get Traefik's own `404 page not found`.
+With the tunnel up, open the app in the browser at [http://sample-nodejs.127.0.0.1.nip.io/my-app](http://sample-nodejs.127.0.0.1.nip.io/my-app). It answers `Hello, World!`. Only the Public paths `/my-app` and `/about` have a route, so `/` and every other path get Traefik's own `404 page not found`. The tunnel also turns both Applications Healthy in ArgoCD. Until then they show Progressing: ArgoCD rates a LoadBalancer Service and an Ingress Progressing until they have an address, and the tunnel gives Traefik's Service one, which Traefik copies onto the app's Ingress.
 
-`scripts/verify-bootstrap.sh` checks the whole setup and prints PASS, FAIL or SKIP for each check: the cluster, ArgoCD, Traefik, the namespace labels, the pull secret, the app's Application (source, sync policy, Synced and Healthy), that the app process runs as uid 1000, and `/my-app` through Traefik. The tunnel checks run only while the tunnel is up; the other HTTP checks go through a port-forward.
+`scripts/verify-bootstrap.sh` checks the whole setup and prints PASS, FAIL or SKIP for each check: the cluster, ArgoCD, Traefik, the namespace labels, the pull secret, the app's Application (source, sync policy, Synced, Healthy or waiting for the tunnel), that the app process runs as uid 1000, and `/my-app` through Traefik. The tunnel checks run only while the tunnel is up; the other HTTP checks go through a port-forward.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

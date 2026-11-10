@@ -240,7 +240,8 @@ traefik_404_through_tunnel() {
 app_greets_through_tunnel() {
   local body="$tmp_dir/tunnel-my-app.body" status
   status="$(request "http://${APP_HOST}/my-app" "$body")"
-  answers_app_greeting "$status" "$body"
+  answers_app_greeting "$status" "$body" &&
+    [[ "$(app_field "$APP" '{.status.sync.status}/{.status.health.status}')" == "Synced/Healthy" ]]
 }
 
 # Every app pod is Running, and the app process in it (PID 1 of the app
@@ -284,8 +285,24 @@ app_deploys_to_app_namespace() {
   [[ "$(app_field "$APP" '{.spec.destination.server} {.spec.destination.namespace}')" == "https://kubernetes.default.svc $APP_NAMESPACE" ]]
 }
 
-app_synced_healthy() {
-  [[ "$(app_field "$APP" '{.status.sync.status}/{.status.health.status}')" == "Synced/Healthy" ]]
+app_synced() {
+  [[ "$(app_field "$APP" '{.status.sync.status}')" == "Synced" ]]
+}
+
+# ArgoCD rates an Ingress Progressing until it has an address. Traefik copies
+# its LoadBalancer Service's address onto the Ingress, so the app's Ingress
+# gets one only while `minikube tunnel` runs. Without the tunnel, Progressing
+# is expected, provided the Ingress really has no address and the app's
+# Deployment is available (its pods pass the readiness probe).
+app_healthy_or_waiting_for_tunnel() {
+  case "$(app_field "$APP" '{.status.health.status}')" in
+    Healthy) return 0 ;;
+    Progressing)
+      [[ -z "$(field -n "$APP_NAMESPACE" ingress "$APP" -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')" &&
+        "$(field -n "$APP_NAMESPACE" deployment "$APP" -o jsonpath='{.status.availableReplicas}')" =~ ^[1-9] ]]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 check "minikube profile '$MINIKUBE_PROFILE' is running" minikube_running
@@ -307,13 +324,14 @@ check "pull secret ${PULL_SECRET} in ${APP_NAMESPACE} is a registry credential f
 check "${APP} Application renders gitops/charts/sample-nodejs at main with values-dev.yaml" app_renders_dev_chart
 check "${APP} Application deploys into namespace ${APP_NAMESPACE}" app_deploys_to_app_namespace
 check "${APP} Application syncs automatically with prune, self-heal and namespace creation" app_syncs_automatically "$APP"
-check "${APP} Application is Synced and Healthy" app_synced_healthy
+check "${APP} Application is Synced" app_synced
+check "${APP} Application is Healthy (or Progressing only until the tunnel gives the Ingress an address)" app_healthy_or_waiting_for_tunnel
 check "app pods in ${APP_NAMESPACE} are Running, with the app process as uid ${APP_UID}" app_pods_run_as_app_uid
 check "/my-app answers \"${APP_GREETING}\" through Traefik for Host ${APP_HOST} (port-forward)" app_greets_through_port_forward
 
 if [[ -n "$(lb_address)" ]]; then
   check "http://${APP_HOST}/ answers Traefik's 404 through the tunnel, and traefik is Healthy" traefik_404_through_tunnel
-  check "http://${APP_HOST}/my-app answers \"${APP_GREETING}\" through the tunnel" app_greets_through_tunnel
+  check "http://${APP_HOST}/my-app answers \"${APP_GREETING}\" through the tunnel, and ${APP} is Synced and Healthy" app_greets_through_tunnel
 else
   printf 'SKIP  http://%s/ and /my-app through the tunnel (run "minikube tunnel -p %s" in another terminal, then re-run)\n' "$APP_HOST" "$MINIKUBE_PROFILE"
 fi
