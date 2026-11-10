@@ -1,0 +1,55 @@
+# cert-manager, installed by ArgoCD from the official Jetstack Helm chart. It
+# issues the certificate for the Ingress when Ingress TLS is on (ticket 31).
+# The ClusterIssuer it needs is a separate Application, cluster-issuer.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  # Deleting this Application (or removing this file from git) also deletes
+  # the cert-manager resources it created. Its CRDs stay (crds.keep), so the
+  # issuers and certificates they hold are not deleted with it.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://charts.jetstack.io
+    chart: cert-manager
+    # Chart v1.21.3 ships cert-manager v1.21.3 (the latest stable release).
+    targetRevision: v1.21.3
+    helm:
+      releaseName: cert-manager
+      valuesObject:
+        crds:
+          # The chart installs and upgrades its own CRDs.
+          enabled: true
+          keep: true
+        # Modest requests: the minikube node has 4 GiB and the cluster already
+        # uses about 2.6 GiB. No limits, so a burst is not throttled.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+        webhook:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+        cainjector:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # The chart ships large CRDs; server-side apply keeps them out of the
+      # size-limited last-applied-configuration annotation.
+      - ServerSideApply=true

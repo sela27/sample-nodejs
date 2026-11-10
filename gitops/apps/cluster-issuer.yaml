@@ -1,0 +1,40 @@
+# The self-signed ClusterIssuer that signs the dev Ingress certificate. It is
+# its own Application, apart from cert-manager, because the root Application
+# does not wait for a child Application to be healthy: a ClusterIssuer synced
+# in the same Application as the chart would be applied before its CRD exists.
+#
+# Ordering on a fresh Bootstrap, with no manual step:
+#   1. ArgoCD skips the dry run of a kind whose CRD is missing
+#      (SkipDryRunOnMissingResource), so the sync does not fail up front.
+#   2. The apply itself fails until cert-manager has installed the CRD and its
+#      webhook answers; the retry policy then tries again with backoff, for
+#      long enough to cover cert-manager's install.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-issuer
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sela27/sample-nodejs.git
+    targetRevision: main
+    path: gitops/cluster-issuer
+  destination:
+    server: https://kubernetes.default.svc
+    # ClusterIssuer is cluster-scoped; the namespace is not used.
+    namespace: cert-manager
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 15
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
