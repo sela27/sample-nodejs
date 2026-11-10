@@ -1,0 +1,11 @@
+# A self-signed cert-manager issuer: it signs each certificate with the
+# certificate's own key, so a browser warns about it (there is no Let's Encrypt
+# for a 127.0.0.1 host). The certificate's secret holds the certificate as
+# ca.crt too, which the smoke test trusts.
+# The name is the one values-dev.yaml sets as ingress.tls.clusterIssuer.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}

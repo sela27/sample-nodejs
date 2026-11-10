@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Chart Gate: lints the Helm chart, renders it with the dev values (once as
-# is, once with Ingress TLS on, once with the ServiceMonitor on), validates the rendered manifests against the
+# is, which has Ingress TLS on, once with Ingress TLS off, once with TLS on and
+# another issuer, once with the ServiceMonitor on), validates the rendered manifests against the
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
 # rollout checksum, the HPA and the PodDisruptionBudget, the zero-downtime
 # rollout settings, the NetworkPolicy that
-# admits only Traefik to the app port, the standard labels, and that the TLS
-# flag adds the TLS section and the cert-manager issuer annotation and nothing
-# else, and that the ServiceMonitor flag, off by default, adds only a
+# admits only Traefik to the app port, the standard labels, that dev has TLS
+# on with the self-signed issuer and the secret cert-manager fills, that the
+# TLS flag adds the TLS section and the cert-manager issuer annotation and
+# nothing else, and that the ServiceMonitor flag, off by default, adds only a
 # ServiceMonitor for /metrics and the monitoring namespace as a second peer of
 # the NetworkPolicy.
 #
@@ -30,9 +32,14 @@ CHART_DIR="$REPO_ROOT/gitops/charts/sample-nodejs"
 DEV_VALUES="$CHART_DIR/values-dev.yaml"
 # The same release name ArgoCD uses for the dev Environment.
 RELEASE="sample-nodejs-dev"
-# Ingress TLS is off by default. A second render turns it on with this
-# cert-manager ClusterIssuer name, which the checks then expect on the Ingress.
+# Ingress TLS is off by default in the chart and on in the dev values, with the
+# self-signed ClusterIssuer that the cluster-issuer Application delivers (name
+# from the spec, not from the chart). One render turns TLS off, to show what the
+# flag adds; another turns it on with a different issuer name, to show that the
+# value reaches the Ingress.
+DEV_TLS_ISSUER="selfsigned-issuer"
 TLS_ISSUER="check-chart-issuer"
+TLS_OFF=(--set ingress.tls.enabled=false)
 TLS_ON=(--set ingress.tls.enabled=true --set-string "ingress.tls.clusterIssuer=$TLS_ISSUER")
 
 # The ServiceMonitor is off by default. A third render turns it on with values
@@ -63,6 +70,7 @@ done
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 rendered="$tmp_dir/dev.yaml"
+notls_rendered="$tmp_dir/dev-notls.yaml"
 tls_rendered="$tmp_dir/dev-tls.yaml"
 sm_rendered="$tmp_dir/dev-servicemonitor.yaml"
 
@@ -81,10 +89,16 @@ else
   fail "helm lint --strict"
 fi
 
-if helm lint --strict "$CHART_DIR" -f "$DEV_VALUES" "${TLS_ON[@]}"; then
-  pass "helm lint --strict with Ingress TLS on"
+if helm lint --strict "$CHART_DIR" -f "$DEV_VALUES" "${TLS_OFF[@]}"; then
+  pass "helm lint --strict with Ingress TLS off"
 else
-  fail "helm lint --strict with Ingress TLS on"
+  fail "helm lint --strict with Ingress TLS off"
+fi
+
+if helm lint --strict "$CHART_DIR" -f "$DEV_VALUES" "${TLS_ON[@]}"; then
+  pass "helm lint --strict with Ingress TLS on and another issuer"
+else
+  fail "helm lint --strict with Ingress TLS on and another issuer"
 fi
 
 if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" >"$rendered"; then
@@ -94,10 +108,17 @@ else
   exit 1
 fi
 
-if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" "${TLS_ON[@]}" >"$tls_rendered"; then
-  pass "render with the dev values and Ingress TLS on"
+if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" "${TLS_OFF[@]}" >"$notls_rendered"; then
+  pass "render with the dev values and Ingress TLS off"
 else
-  fail "render with the dev values and Ingress TLS on"
+  fail "render with the dev values and Ingress TLS off"
+  exit 1
+fi
+
+if helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" "${TLS_ON[@]}" >"$tls_rendered"; then
+  pass "render with the dev values and Ingress TLS on with another issuer"
+else
+  fail "render with the dev values and Ingress TLS on with another issuer"
   exit 1
 fi
 
@@ -116,7 +137,7 @@ fi
 
 # With no issuer, cert-manager would ignore the Ingress and no certificate
 # would ever arrive, so the chart must refuse to render instead.
-if render_error="$(helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" --set ingress.tls.enabled=true 2>&1 >/dev/null)"; then
+if render_error="$(helm template "$RELEASE" "$CHART_DIR" -f "$DEV_VALUES" --set ingress.tls.enabled=true --set-string ingress.tls.clusterIssuer= 2>&1 >/dev/null)"; then
   fail "Ingress TLS on without a ClusterIssuer does not render" "it rendered"
 elif [[ "$render_error" != *ingress.tls.clusterIssuer* ]]; then
   fail "Ingress TLS on without a ClusterIssuer does not render" "failed for another reason: $render_error"
@@ -131,7 +152,7 @@ kubeconform_label="kubeconform -strict against Kubernetes $KUBERNETES_VERSION an
 if (cd "$REPO_ROOT" && kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
   -schema-location default \
   -schema-location "$SCHEMAS_DIR/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" \
-  "$rendered" "$tls_rendered" "$sm_rendered"); then
+  "$rendered" "$notls_rendered" "$tls_rendered" "$sm_rendered"); then
   pass "$kubeconform_label"
 else
   fail "$kubeconform_label"
@@ -504,10 +525,13 @@ backends="$ingress | .spec.rules[].http.paths[].backend.service"
 
 expect "one Ingress" "1" "$(q "[$ingress] | length")"
 expect "Ingress class" "traefik" "$(q "$ingress | .spec.ingressClassName")"
-# ADR-0002: no controller-specific annotations, so the controller can be swapped.
-expect "Ingress has no annotations" "0" "$(q "$ingress | .metadata.annotations // {} | length")"
-# Ingress TLS is off by default.
-expect "Ingress has no TLS section" "0" "$(q "$ingress | .spec.tls // [] | length")"
+# ADR-0002: no controller-specific annotations, so the controller can be
+# swapped. With TLS off there are no annotations at all; with TLS on (dev) the
+# one annotation is cert-manager's, checked below.
+expect "TLS off: Ingress has no annotations" "0" \
+  "$(qf "$notls_rendered" "$ingress | .metadata.annotations // {} | length")"
+expect "TLS off: Ingress has no TLS section" "0" \
+  "$(qf "$notls_rendered" "$ingress | .spec.tls // [] | length")"
 expect "Ingress hosts" "$DEV_HOST" "$(q "[$ingress | .spec.rules[].host] | join(\" \")")"
 expect "Ingress paths are the Public paths only" "$PUBLIC_PATHS" \
   "$(q "[$ingress | .spec.rules[].http.paths[].path] | sort | join(\" \")")"
@@ -551,12 +575,24 @@ expect "NetworkPolicy admits only Traefik's pods in the $TRAEFIK_NAMESPACE names
 # Ingress TLS on (ingress.tls.enabled). cert-manager sees the issuer
 # annotation, issues a certificate for the host in the TLS section and stores
 # it in the secret that section names; Traefik serves it.
+#
+# The dev Environment has TLS on, with the self-signed ClusterIssuer. The
+# secret is named after the release, and the smoke test reads the CA from it.
+DEV_TLS_SECRET="$RELEASE-tls"
+expect "dev: one TLS entry" "1" "$(q "[$ingress | .spec.tls[]] | length")"
+expect "dev: TLS hosts" "$DEV_HOST" "$(q "[$ingress | .spec.tls[].hosts[]] | join(\" \")")"
+expect "dev: TLS secret name" "$DEV_TLS_SECRET" "$(q "$ingress | .spec.tls[0].secretName")"
+expect "dev: Ingress annotations" "cert-manager.io/cluster-issuer=$DEV_TLS_ISSUER" \
+  "$(q "[$ingress | .metadata.annotations // {} | to_entries | .[] | .key + \"=\" + .value] | join(\" \")")"
+
+# The flag, switched on with another issuer name, so the checks show that the
+# value reaches the Ingress.
 q_tls() { yq ea "$1" "$tls_rendered" | tr -d '\r'; }
 
 # The flag touches nothing else: without the Ingress's TLS section and
-# annotations, the TLS-on render is the default render, object for object.
+# annotations, the TLS-on render is the TLS-off render, object for object.
 without_tls='with(select(.kind == "Ingress"); del(.spec.tls) | del(.metadata.annotations))'
-tls_diff="$(diff <(yq "$without_tls" "$rendered") <(yq "$without_tls" "$tls_rendered") || true)"
+tls_diff="$(diff <(yq "$without_tls" "$notls_rendered") <(yq "$without_tls" "$tls_rendered") || true)"
 expect "TLS on: only the Ingress's TLS section and annotations change" "no other change" \
   "$([[ -z "$tls_diff" ]] && echo "no other change" || echo "${tls_diff//$'\n'/ | }")"
 

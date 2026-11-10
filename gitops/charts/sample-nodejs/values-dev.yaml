@@ -11,3 +11,9 @@ ingress:
   # nip.io resolves this name to 127.0.0.1, where `minikube tunnel` exposes
   # Traefik, so no hosts-file edit is needed.
   host: sample-nodejs.127.0.0.1.nip.io
+  # HTTPS with a self-signed certificate: cert-manager (gitops/apps/cert-manager.yaml)
+  # issues it from the ClusterIssuer that gitops/cluster-issuer delivers. Plain
+  # HTTP on port 80 keeps working; there is no redirect.
+  tls:
+    enabled: true
+    clusterIssuer: selfsigned-issuer
