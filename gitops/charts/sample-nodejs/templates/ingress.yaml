@@ -1,15 +1,29 @@
 {{- $fullname := include "sample-nodejs.fullname" . -}}
+{{- $host := required "ingress.host must be set in the Environment's values file" .Values.ingress.host -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ $fullname }}
   labels:
     {{- include "sample-nodejs.labels" . | nindent 4 }}
+  {{- if .Values.ingress.tls.enabled }}
+  annotations:
+    # Read by cert-manager, not by the Ingress controller: it names the
+    # ClusterIssuer that signs the certificate for the TLS section below.
+    cert-manager.io/cluster-issuer: {{ required "ingress.tls.clusterIssuer must be set when ingress.tls.enabled is true" .Values.ingress.tls.clusterIssuer | quote }}
+  {{- end }}
 spec:
   # Only the class, no controller-specific annotations (ADR-0002).
   ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      # cert-manager creates this secret and keeps the certificate in it.
+      secretName: {{ $fullname }}-tls
+  {{- end }}
   rules:
-    - host: {{ required "ingress.host must be set in the Environment's values file" .Values.ingress.host | quote }}
+    - host: {{ $host | quote }}
       http:
         paths:
           {{- range .Values.ingress.publicPaths }}

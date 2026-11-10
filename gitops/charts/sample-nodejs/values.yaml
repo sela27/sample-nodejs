@@ -44,3 +44,10 @@ ingress:
   publicPaths:
     - /my-app
     - /about
+  # HTTPS through cert-manager, off by default. When on, the Ingress gets a TLS
+  # section for the host, and cert-manager issues the certificate.
+  tls:
+    enabled: false
+    # The cert-manager ClusterIssuer that signs the certificate. It depends on
+    # the cluster, so the Environment's values file sets it with the flag.
+    clusterIssuer: ""
