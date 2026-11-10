@@ -570,7 +570,18 @@ The preset is 9.3.1, not the newer 10.x. The 10.x preset needs `conventional-cha
 * **deps:** update the vulnerable dependencies caught by the new image Gate ([#10](https://github.com/sela27/sample-nodejs/issues/10)) ([1511b7b](https://github.com/sela27/sample-nodejs/commit/1511b7b320b07f866fa7467623f90fc435d5dab6))
 ```
 
-The first push creates the GHCR package, which is private by default. The image's `org.opencontainers.image.source` label tells GHCR which repo the package belongs to. After that first push, the package settings are checked by hand: the package must be private and linked to this repo.
+The first push creates the GHCR package. The image's `org.opencontainers.image.source` label tells GHCR which repo the package belongs to. Do not count on the package being private: this one came out public, and GHCR served its manifests to anonymous requests. So after that first push, two package settings are set by hand:
+
+- **Visibility: private.** Set under Package settings, Danger Zone, Change visibility.
+- **Manage Actions access: this repo with the `Write` role.** A package published from a workflow gives the publishing repo `Admin` by default, which would also let the `image` job's `packages: write` token delete versions and change the package's settings. Pushing the image, its signature and its attestation needs only `Write`.
+
+Checked on 2026-11-10 after the switch:
+
+- Anonymous access is refused: GHCR's token endpoint answers 401 for an anonymous pull scope, and the `1.1.0` manifest answers 401 without a token and 403 with an anonymous one.
+- A pod in `sample-nodejs-dev` with `imagePullPolicy: Always`, running under the chart's ServiceAccount, pulled `1.1.0` through the `ghcr-pull` secret and ran. The cached copy on the node could not stand in, because `Always` makes the kubelet authenticate to the registry.
+- A screenshot of the package page shows it Private and linked to this repo:
+
+![The GHCR package page, Private, linked to sample-nodejs](docs/screenshots/15-ghcr-package-private.png)
 
 To preview the next Release locally, run the same dry run as the `version` job from an up-to-date `main`. The token lets the GitHub plugin check the repo. Nothing is tagged or published.
 
@@ -686,6 +697,7 @@ Each security control in the delivery path, where it is enforced, and what it st
 | Restricted Pod Security admission | Labels `pod-security.kubernetes.io/enforce`, `audit` and `warn` set to `restricted` on the `sample-nodejs-dev` namespace by Bootstrap | Any pod in the app namespace that breaks the restricted profile, whatever its chart says: the API server refuses to create it. |
 | NetworkPolicy | The chart's NetworkPolicy, enforced by Calico, the CNI that Bootstrap starts minikube with. A CNI without NetworkPolicy support accepts the object and ignores it, so the control holds only on a cluster that enforces it | Any pod other than Traefik's, in any namespace, the app's own included, opening a connection to the app, and so reaching the internal paths `/classified` and `/metrics` that the Ingress does not route. Only Traefik's pods in the `traefik` namespace reach the app port ([NetworkPolicy on the cluster](#networkpolicy-on-the-cluster)). |
 | Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)), which never prints the token | The `read:packages` token reaching the repo or a log. |
+| Private image, least-privilege publishing | GHCR package visibility Private; the repo's Actions access to the package is `Write`, not GitHub's default `Admin` ([Release flow](#release-flow)) | Anyone pulling the image without a token (verified: anonymous requests get 401 and 403). A compromised step in the release job deleting published versions or changing the package's settings; with `Write` it can only add. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |

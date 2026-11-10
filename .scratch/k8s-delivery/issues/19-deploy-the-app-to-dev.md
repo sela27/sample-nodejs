@@ -10,6 +10,8 @@
 
 **Human step:** create a classic PAT with only `read:packages` and export it as `GHCR_PULL_TOKEN` before running Bootstrap. Take a browser screenshot of `/my-app`.
 
+**PAT and Bootstrap done (2026-11-10):** the human created the token and re-ran Bootstrap with it. It created `ghcr-pull` in `sample-nodejs-dev` at 17:49 UTC, and the chart's ServiceAccount lists it. Once the package was private, a pod with `imagePullPolicy: Always` pulled `1.1.0` through that secret (see ticket 15). The browser screenshot is still open, and it needs `minikube tunnel`.
+
 - [x] Bootstrap creates the app namespace with the restricted Pod Security labels, and creates the registry pull secret idempotently. It fails with a clear message if `GHCR_PULL_TOKEN` is unset, and never prints the token.
 - [x] A `sample-nodejs-dev` child Application uses our chart with the `dev` values, automated sync with prune and self-heal, and its own namespace.
 - [ ] ArgoCD shows the Application Synced and Healthy, with pods running as uid 1000.
