@@ -11,6 +11,6 @@
 **Human step:** screenshot of a GitHub Release with the SBOM attached.
 
 - [x] The release job generates a CycloneDX SBOM of the pushed image, by digest, and semantic-release attaches it to the GitHub Release.
-- [ ] Verified on the next Release after this merges: the asset is present and parses as CycloneDX. Pending, verified with the v1.1.0 Release (ticket 17).
+- [x] Verified on the next Release after this merges: the asset is present and parses as CycloneDX. (Verified with the v1.1.0 Release, run 42843956960: `sample-nodejs-1.1.0.cdx.json` is attached, `cyclonedx/cyclonedx-cli:0.33.1 validate --fail-on-errors` prints `BOM validated successfully.`, it is CycloneDX 1.7 with 98 components, and its RepoDigest is the `1.1.0` digest `sha256:ea0adf3f…`.)
 - [x] The README supply-chain section describes the SBOM.
 - [x] PR title is `ci: …`. Status set to `done` in the same PR.
