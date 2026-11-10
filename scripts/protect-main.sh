@@ -27,6 +27,7 @@ REQUIRED_CHECKS=(
   dockerfile-lint
   chart
   secrets
+  image-gate
 )
 
 # GitHub Actions' app id. Each required check is bound to it, so only a

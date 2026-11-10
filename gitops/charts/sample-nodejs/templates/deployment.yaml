@@ -13,6 +13,11 @@ spec:
     metadata:
       labels:
         {{- include "sample-nodejs.labels" . | nindent 8 }}
+      annotations:
+        # A change to the ConfigMap alone restarts no pod, because environment
+        # variables are read only at container start. This checksum of the
+        # ConfigMap's data changes the pod template with it, so the pods roll.
+        checksum/config: {{ include "sample-nodejs.config" . | sha256sum }}
     spec:
       serviceAccountName: {{ include "sample-nodejs.fullname" . }}
       # Also set on the ServiceAccount; set here too, because the pod's own
@@ -38,10 +43,16 @@ spec:
             capabilities:
               drop:
                 - ALL
+          # PORT and NODE_ENV from the ConfigMap. They override the image's own
+          # environment variables of the same name.
+          envFrom:
+            - configMapRef:
+                name: {{ include "sample-nodejs.fullname" . }}
           ports:
-            # The app's default PORT. The probes and the Service refer to it by name.
+            # The same value as PORT in the ConfigMap, so the two cannot drift
+            # apart. The probes and the Service refer to it by name.
             - name: http
-              containerPort: 8080
+              containerPort: {{ .Values.config.port }}
               protocol: TCP
           # Holds off the other probes until the app has started once, so a slow
           # start is not mistaken for a hung process.

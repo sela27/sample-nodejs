@@ -1,0 +1,21 @@
+# Accepted exceptions to the image Gate (job image-gate in
+# .github/workflows/pr.yml). Trivy skips every vulnerability ID listed here,
+# one per line.
+#
+# This file is empty on purpose: every HIGH or CRITICAL finding blocks the PR
+# until it is fixed. Fixing means a dependency or base image update, not an
+# entry here.
+#
+# An entry is added only when a finding cannot be fixed yet, and only with a
+# comment directly above it that gives both:
+#   1. the justification: why it cannot be fixed now, for example no fixed
+#      version exists yet, or the fix needs a breaking upgrade;
+#   2. the reason it is safe: why the vulnerable code cannot be reached or
+#      exploited in this image.
+# An entry without both is not merged. Remove the entry in the PR that ships
+# the fix.
+#
+# Format (example, not a real entry):
+#   # CVE-2099-0001 in example-lib 1.2.3. Justification: no fixed version yet.
+#   # Safe because: the app never calls the vulnerable parser.
+#   CVE-2099-0001

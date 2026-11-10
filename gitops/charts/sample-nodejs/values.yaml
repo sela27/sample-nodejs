@@ -4,6 +4,15 @@
 
 replicaCount: 1
 
+# The app's configuration. The chart puts it in a ConfigMap that the container
+# loads as environment variables, and a change to it rolls the pods.
+config:
+  # PORT, the port the app listens on. The container port uses the same value,
+  # and the probes and the Service reach the app through that port.
+  port: 8080
+  # NODE_ENV. It overrides the NODE_ENV that the image sets.
+  nodeEnv: production
+
 image:
   # Set by each Environment's values file.
   repository: ""
