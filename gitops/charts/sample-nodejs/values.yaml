@@ -51,3 +51,17 @@ ingress:
     # The cert-manager ClusterIssuer that signs the certificate. It depends on
     # the cluster, so the Environment's values file sets it with the flag.
     clusterIssuer: ""
+
+# The NetworkPolicy admits traffic to the app port only from the Ingress
+# controller, so the internal paths (/classified, /metrics, ...) are out of
+# reach of every other pod, in any namespace, the app's own included. It takes
+# effect only where the CNI enforces NetworkPolicy; Bootstrap starts minikube
+# with Calico for that. Egress is not restricted.
+networkPolicy:
+  ingressController:
+    # The namespace Traefik runs in (gitops/apps/traefik.yaml), matched by the
+    # kubernetes.io/metadata.name label that Kubernetes sets on every namespace.
+    namespace: traefik
+    # The labels that Traefik's official chart puts on its pods.
+    podLabels:
+      app.kubernetes.io/name: traefik

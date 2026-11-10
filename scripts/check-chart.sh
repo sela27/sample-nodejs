@@ -4,7 +4,8 @@
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
-# rollout checksum, the standard labels, and that the TLS flag adds the TLS
+# rollout checksum, the NetworkPolicy that admits only Traefik to the app
+# port, the standard labels, and that the TLS flag adds the TLS
 # section and the cert-manager issuer annotation and nothing else.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
@@ -311,7 +312,8 @@ if render_with node-env --set config.nodeEnv=development; then
 fi
 
 # One value sets the port: another port moves PORT, the container port, the
-# probes and the Service's target together, and changes the checksum.
+# probes, the Service's target and the NetworkPolicy's port together, and
+# changes the checksum.
 OTHER_PORT="9090"
 if render_with port --set config.port="$OTHER_PORT"; then
   variant="$tmp_dir/port.yaml"
@@ -324,6 +326,8 @@ if render_with port --set config.port="$OTHER_PORT"; then
   done
   expect "port $OTHER_PORT: Service port $SERVICE_PORT reaches it" "$OTHER_PORT" \
     "$(container_port_number "$(qf "$variant" "$service | .spec.ports[] | select(.port == $SERVICE_PORT) | .targetPort")" "$variant")"
+  expect "port $OTHER_PORT: NetworkPolicy port" "$OTHER_PORT" \
+    "$(container_port_number "$(qf "$variant" 'select(.kind == "NetworkPolicy") | .spec.ingress[0].ports[0].port')" "$variant")"
   expect "changing the port changes the checksum" "changed" "$(differs "$dev_checksum" "$(checksum_of "$variant")")"
 fi
 
@@ -353,6 +357,36 @@ expect "Ingress backends are the Service" "$(q "$service | .metadata.name")" \
 for port_ref in $(q "[$backends | .port.number // .port.name] | unique | .[]"); do
   expect "Ingress backend port $port_ref is Service port $SERVICE_PORT" "$SERVICE_PORT" "$(service_port_number "$port_ref")"
 done
+
+# The NetworkPolicy: only the Ingress controller reaches the app port, so the
+# internal paths such as /classified and /metrics are out of reach of every
+# other pod. The peer must be Traefik's pods in Traefik's namespace, both in
+# one peer: as two peers they would admit any pod in that namespace, or any pod
+# with Traefik's labels in the app's own namespace. Egress stays open (spec).
+networkpolicy='select(.kind == "NetworkPolicy")'
+np_rule="$networkpolicy | .spec.ingress[0]"
+# The namespace the Traefik Application deploys into, read from that
+# Application, so moving Traefik without updating the chart fails here.
+TRAEFIK_NAMESPACE="$(yq '.spec.destination.namespace' "$REPO_ROOT/gitops/apps/traefik.yaml" | tr -d '\r')"
+# Kubernetes sets kubernetes.io/metadata.name on every namespace, and Traefik's
+# official chart sets app.kubernetes.io/name on its pods.
+TRAEFIK_PEER="[{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"$TRAEFIK_NAMESPACE\"}},\"podSelector\":{\"matchLabels\":{\"app.kubernetes.io/name\":\"traefik\"}}}]"
+
+expect "one NetworkPolicy" "1" "$(q "[$networkpolicy] | length")"
+expect "NetworkPolicy restricts ingress only" "Ingress" "$(q "[$networkpolicy | .spec.policyTypes[]] | join(\" \")")"
+np_selector="$(q "$networkpolicy | .spec.podSelector.matchLabels // {} | to_entries | .[] | .key + \"=\" + .value" | sort)"
+np_expressions="$(q "$networkpolicy | .spec.podSelector.matchExpressions // [] | length")"
+unmatched="$(comm -23 <(printf '%s\n' "$np_selector") <(printf '%s\n' "$pod_labels"))"
+expect "NetworkPolicy selects the app pods" "selects" \
+  "$([[ -n "$np_selector" && -z "$unmatched" && "$np_expressions" == "0" ]] && echo selects || echo "selector '${np_selector//$'\n'/,}' with $np_expressions expression(s)")"
+expect "NetworkPolicy has one ingress rule" "1" "$(q "[$networkpolicy | .spec.ingress[]] | length")"
+expect "NetworkPolicy admits one port" "1" "$(q "[$np_rule | .ports[]] | length")"
+expect "NetworkPolicy port is the container port" "$CONTAINER_PORT" \
+  "$(container_port_number "$(q "$np_rule | .ports[0].port")")"
+expect "NetworkPolicy port protocol" "TCP" "$(q "$np_rule | .ports[0].protocol // \"TCP\"")"
+expect "NetworkPolicy port is not a range" "no endPort" "$(q "$np_rule | .ports[0].endPort // \"no endPort\"")"
+expect "NetworkPolicy admits only Traefik's pods in the $TRAEFIK_NAMESPACE namespace" "$TRAEFIK_PEER" \
+  "$(q "[$np_rule | .from[]] | sort_keys(..) | to_json(0)")"
 
 # Ingress TLS on (ingress.tls.enabled). cert-manager sees the issuer
 # annotation, issues a certificate for the host in the TLS section and stores
