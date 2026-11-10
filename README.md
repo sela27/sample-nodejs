@@ -335,6 +335,13 @@ kubectl -n sample-nodejs-dev get certificate        # READY is True
 scripts/smoke-test.sh --port-forward --https        # the certificate is verified against the secret's CA
 ```
 
+**Checked on minikube** (2026-11-10), after the merge of the PR that added this. ArgoCD synced `cert-manager` and `cluster-issuer` from a hard refresh of `root`, with no manual step; the ClusterIssuer `selfsigned-issuer` and the Certificate `sample-nodejs-dev-tls` were Ready within seconds of the pods starting, and the secret's `ca.crt` is filled (the self-signed certificate itself). The smoke test passed with the CA verified, not `--insecure`, in all four ways to reach the app: `BASE_URL=https://sample-nodejs.127.0.0.1.nip.io` through `minikube tunnel`, plain HTTP through the tunnel, `--port-forward --https` and `--port-forward`. With a CA that did not sign the certificate (a throwaway one in `CA_CERT`), the HTTPS run got no response, so the check does reject a wrong certificate. `scripts/verify-bootstrap.sh` passed all its checks.
+
+| | Before | After cert-manager |
+| --- | --- | --- |
+| minikube container memory (`docker stats`) | about 2.6 GiB of 4 GiB | 2.89 GiB of 4 GiB |
+| cert-manager pods (`kubectl top`) | n/a | controller 27 Mi, cainjector 29 Mi, webhook 12 Mi |
+
 ### Turning monitoring on
 
 The app serves Prometheus text on `/metrics`, including `root_access_total`. The Ingress does not route that path, so Prometheus has to reach the Service from inside the cluster, and the NetworkPolicy has to let it in. One flag does both:
