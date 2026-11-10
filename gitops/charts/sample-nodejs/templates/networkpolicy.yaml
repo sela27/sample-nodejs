@@ -25,6 +25,14 @@ spec:
           podSelector:
             matchLabels:
               {{- required "networkPolicy.ingressController.podLabels must be set" $controller.podLabels | toYaml | nindent 14 }}
+        {{- if .Values.serviceMonitor.enabled }}
+        # The monitoring namespace, so Prometheus can scrape /metrics. Any pod
+        # in it is admitted: the Prometheus pod's labels depend on how it was
+        # installed, and nothing but monitoring is meant to run there.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.monitoring.namespace must be set" .Values.networkPolicy.monitoring.namespace | quote }}
+        {{- end }}
       ports:
         # The container port, by name, so it follows config.port. A
         # NetworkPolicy sees the pod's port, not the Service's port 80.

@@ -1,0 +1,25 @@
+{{- if .Values.serviceMonitor.enabled -}}
+# For a Prometheus Operator (kube-prometheus-stack). The CRD must exist in the
+# cluster before this renders into it, which is why the flag is off by default.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "sample-nodejs.fullname" . }}
+  labels:
+    {{- include "sample-nodejs.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # The app's Service, in the release's own namespace (the default when no
+  # namespaceSelector is set). The same labels the Service selects pods by,
+  # which pin this release.
+  selector:
+    matchLabels:
+      {{- include "sample-nodejs.selectorLabels" . | nindent 6 }}
+  endpoints:
+    # The Service's port by name, so it follows the Service.
+    - port: http
+      path: /metrics
+      interval: {{ required "serviceMonitor.interval must be set" .Values.serviceMonitor.interval | quote }}
+{{- end }}
