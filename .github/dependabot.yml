@@ -1,0 +1,83 @@
+# Dependabot: weekly version updates for every place this repo pins a
+# dependency. Its PRs run the same required checks as any other PR.
+#
+# A squash merge makes the PR title the commit on main, and the commit type
+# decides whether that merge produces a Release (.releaserc.yaml). Dependabot
+# puts the prefix and ": " in front of its title, as in
+# `fix(deps): bump the production group with 2 updates`. Only the app's
+# production npm dependencies, the code the image runs, use the releasing
+# `fix(deps)`. Everything else uses `chore(deps)` or `ci(deps)`, which produce
+# no Release. No entry sets `include: scope`, which would add a second scope
+# after the one in the prefix.
+#
+# scripts/check-dependabot.sh checks this file against the Dependabot schema
+# and against this policy. Run it after every change here.
+version: 2
+updates:
+  # The app: package.json and package-lock.json at the root.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: fix(deps)
+      prefix-development: chore(deps)
+    groups:
+      # Each group holds one dependency type. A grouped PR with any production
+      # dependency in it takes the production prefix, so a mixed group would
+      # release dev-only changes.
+      production:
+        dependency-type: production
+        update-types: [minor, patch]
+      development:
+        dependency-type: development
+    ignore:
+      # The spec keeps Express 4; Express 5 is out of scope. Ignore rules by
+      # update type filter version updates only, never security updates.
+      - dependency-name: express
+        update-types: ["version-update:semver-major"]
+
+  # The release tooling: release/package.json and release/package-lock.json.
+  # It runs only in the release workflow, so it takes the `ci` type.
+  - package-ecosystem: npm
+    directory: /release
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci(deps)
+    groups:
+      release-tooling:
+        patterns: ["*"]
+    ignore:
+      # A major of semantic-release or of the Conventional Commits preset is
+      # done by hand: the preset's majors follow the release notes writer that
+      # semantic-release bundles (see "Pinned release tooling" in the README),
+      # and no PR check runs the release tooling.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # The base image in the Dockerfile, pinned by tag and digest. Dependabot
+  # moves the digest when node:24-alpine is rebuilt.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    ignore:
+      # Node 24 is the chosen LTS line ("Why node:24-alpine" in the README).
+      # Moving to another major is a decision, not a weekly update.
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+
+  # The actions in .github/workflows, pinned by commit SHA with the version in
+  # a trailing comment. Dependabot updates the SHA and the comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci(deps)
+    groups:
+      actions:
+        patterns: ["*"]
