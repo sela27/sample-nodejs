@@ -16,8 +16,8 @@
 # Signing and provenance belong after the push, the SBOM before the GitHub
 # Release, and the Bump commit after it.
 #
-# The Bump commit carries [skip ci] in its message. GitHub then starts no
-# workflow for that push, this one included.
+# The Bump commit will carry [skip ci] in its message. GitHub starts no
+# workflow for a push whose head commit says that, this one included.
 #
 # Third-party actions are pinned by full commit SHA, with the version in a
 # trailing comment, as in pr.yml.
@@ -62,11 +62,13 @@ jobs:
           persist-credentials: false
           # Every commit and tag, which semantic-release reads.
           fetch-depth: 0
-      # No dependency cache in this workflow: every run installs exactly what
+      # No dependency cache in this workflow, so a cache entry cannot change
+      # what the release runs: every run installs exactly what
       # release/package-lock.json pins, from the registry.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Install the pinned release tooling
         working-directory: release
         run: npm ci --ignore-scripts --no-audit --no-fund
@@ -168,6 +170,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Install the pinned release tooling
         working-directory: release
         run: npm ci --ignore-scripts --no-audit --no-fund
