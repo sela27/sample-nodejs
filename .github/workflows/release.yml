@@ -8,7 +8,9 @@
 #            the run ends here, green.
 #   image    BuildKit build tagged <version> and sha-<short>, the image Gate,
 #            then the push to GHCR. A Gate failure stops the job before it
-#            logs in to the registry.
+#            logs in to the registry. After the push, the job signs the image
+#            by digest with cosign, keyless through GitHub OIDC, and attaches
+#            a build provenance attestation to the same digest.
 #   release  semantic-release for real: the v<version> tag and the GitHub
 #            Release. It runs only after the image is in GHCR, so no tag and
 #            no Release ever exist without their image.
@@ -16,8 +18,7 @@
 #            to <version> and pushes that one-line change to main with the
 #            deploy key. ArgoCD deploys it from there.
 #
-# Signing and provenance belong after the push, and the SBOM before the GitHub
-# Release.
+# The SBOM belongs before the GitHub Release.
 #
 # The Bump commit carries [skip ci] in its message. GitHub starts no workflow
 # for a push whose head commit says that, this one included.
@@ -86,6 +87,10 @@ jobs:
   # again against today's vulnerability database before it reaches the
   # registry. If the scan fails, the login and push steps never run, and the
   # release job is skipped.
+  #
+  # After the push, the job signs the pushed digest and attests its build
+  # provenance. Either one failing fails the job, so the release job, which
+  # needs it, never tags an image that is not signed and attested.
   image:
     needs: version
     if: needs.version.outputs.version != ''
@@ -93,11 +98,21 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      # Push the image, its cosign signature and its provenance attestation.
       packages: write
+      # The GitHub OIDC token that Fulcio, Sigstore's certificate authority,
+      # exchanges for the short-lived signing certificate. Both cosign and the
+      # attest action sign this way, keyless: no signing key exists to leak.
+      id-token: write
+      # Store the provenance attestation through the GitHub attestations API.
+      attestations: write
     env:
       # Keep these two in step with the image-gate job in pr.yml.
       TRIVY_VERSION: 0.76.2
       TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+      # cosign-linux-amd64 from cosign's immutable v3.1.4 GitHub release.
+      COSIGN_VERSION: 3.1.4
+      COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
       # The private GHCR package. The chart's dev values use the same name.
       IMAGE: ghcr.io/sela27/sample-nodejs
       VERSION: ${{ needs.version.outputs.version }}
@@ -152,6 +167,63 @@ jobs:
           docker push "${IMAGE}:${VERSION}"
           docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
           echo "Pushed \`${IMAGE}:${VERSION}\` and \`${IMAGE}:sha-${GITHUB_SHA::7}\`." >> "$GITHUB_STEP_SUMMARY"
+      # The digest Docker recorded for the push. Both tags point at it. The
+      # signature and the attestation name this digest, never a tag, because
+      # a tag can later be moved to another image.
+      - name: Read the digest of the pushed image
+        id: digest
+        run: |
+          mapfile -t refs < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}:${VERSION}" | grep -F "${IMAGE}@")
+          if [[ ${#refs[@]} -ne 1 ]]; then
+            echo "::error::Expected one digest for ${IMAGE}:${VERSION} after the push, found ${#refs[@]}: ${refs[*]}"
+            exit 1
+          fi
+          digest="${refs[0]#"${IMAGE}@"}"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Not a sha256 digest: ${digest}"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # The same way as Trivy above: through the GitHub API with the job
+      # token, and checked against the pinned SHA-256 before it runs.
+      - name: Install pinned cosign
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          gh release download "v${COSIGN_VERSION}" --repo sigstore/cosign \
+            --pattern cosign-linux-amd64 --output cosign
+          echo "${COSIGN_SHA256}  cosign" | sha256sum -c -
+          install -m 0755 cosign "$bin/cosign"
+          "$bin/cosign" version
+      # Keyless: cosign trades the job's OIDC token for a short-lived Fulcio
+      # certificate whose identity is this workflow file on main, signs the
+      # digest, and records the signature in Rekor, Sigstore's public
+      # transparency log. The signature goes to GHCR next to the image, where
+      # the README's `cosign verify` finds it. --yes confirms the upload to the
+      # public log, which a CI job cannot confirm at a prompt.
+      - name: Sign the image by digest with cosign, keyless through GitHub OIDC
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "Signed \`${IMAGE}@${DIGEST}\` with cosign." >> "$GITHUB_STEP_SUMMARY"
+      # A SLSA build provenance attestation: the repo, workflow, commit and run
+      # that built this digest, signed the same keyless way. It is stored
+      # through the GitHub attestations API, where `gh attestation verify`
+      # finds it, and pushed to GHCR next to the image. actions/attest makes
+      # build provenance when given no predicate; attest-build-provenance v4 is
+      # now only a wrapper around it. No storage record: GitHub creates those
+      # only for repos owned by an organization.
+      - name: Attest the build provenance of the image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
 
   # semantic-release for real, with .releaserc.yaml: it tags this commit
   # v<version> and creates the GitHub Release with the notes. No npm publish,

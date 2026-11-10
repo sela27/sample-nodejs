@@ -244,7 +244,7 @@ Like the other tools hosted on GitHub releases, the file is fetched through the 
 
 - Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
 - The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
-- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate` and in the release `image` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
+- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate` and in the release `image` job, cosign in the release `image` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
 - gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
 - Each workflow's default token permission is `contents: read` and nothing else. A job that needs more asks for it in its own `permissions:` block. Only the release workflow does, as listed in [Release flow](#release-flow).
 - `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps. The one exception is the release `bump` job, which keeps its deploy key configured for its own push. No other action runs in that job, and checkout's post step removes the key.
@@ -267,18 +267,18 @@ The first Release is 1.0.0, whatever the type. Only changes to the app or its pr
 The run has four jobs. Each one starts only if the one before it succeeded:
 
 1. **`version`** runs semantic-release in dry-run mode (`release/next-version.mjs`). It reads the commits since the last `v*` tag, logs a verdict for each commit and the release notes it would publish, and creates nothing. If no commit warrants a Release, it logs `No Release from this commit`, and the run ends there, green, with the other three jobs skipped.
-2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge.
+2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge. After the push, it signs the image's digest with cosign and attaches a build provenance attestation to it ([Image signature and provenance](#image-signature-and-provenance)).
 3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes. A last step checks that the tag exists. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
 4. **`bump`** makes the [Bump commit](#bump-commit): it sets the dev image tag to the version and pushes that one-line change to `main` with the deploy key. ArgoCD deploys it from there.
 
 **A Gate failure leaves nothing behind.** When the scan fails, the `image` job stops at that step. Its login and push steps show as skipped, so nothing reaches GHCR. The `release` and `bump` jobs are skipped as well, so no tag, no GitHub Release and no Bump commit are created. The job order guarantees this. The job that creates the tag starts only after the job that pushes, and that job pushes only after the scan passes.
 
-**Job permissions.** The workflow default is `contents: read`. Each job raises only what it uses, and no job gets `issues`, `pull-requests`, `id-token` or `attestations`.
+**Job permissions.** The workflow default is `contents: read`. Each job raises only what it uses. Only the `image` job gets `id-token` and `attestations`, and no job gets `issues` or `pull-requests`.
 
 | Job | Token permissions | Why |
 | --- | --- | --- |
 | `version` | `contents: write` | Before it analyzes anything, semantic-release checks with `git push --dry-run` that it could push the tag, even in dry-run mode. GitHub refuses that check to a read-only token. The job pushes nothing. |
-| `image` | `contents: read`, `packages: write` | Push the image to GHCR. |
+| `image` | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` | Push the image, its signature and its attestation to GHCR. Request the GitHub OIDC token that cosign and `actions/attest` exchange for a short-lived signing certificate. Store the attestation through the GitHub attestations API. |
 | `release` | `contents: write` | Push the tag and create the GitHub Release. |
 | `bump` | none | The repo is public, so the checkout needs no token, and the push uses the deploy key. |
 
@@ -319,6 +319,43 @@ GITHUB_TOKEN="$(gh auth token)" node release/next-version.mjs
 ```
 
 Run it only on `main`. On any other branch, semantic-release force-updates the local `main` from GitHub before it declines to release.
+
+## Image signature and provenance
+
+From 1.1.0 on, every image the release run pushes is signed and carries a build provenance attestation. Both are keyless: no signing key exists, so there is none to leak, store as a secret or rotate. The `image` job does it right after the push:
+
+1. It reads the digest of the pushed image, which both tags point at. The signature and the attestation name that digest, never a tag, because a tag can later be moved to another image.
+2. cosign 3.1.4 signs the digest. It exchanges the job's GitHub OIDC token for a certificate from Fulcio, Sigstore's certificate authority, valid for ten minutes. The certificate names the workflow that asked for it, `https://github.com/sela27/sample-nodejs/.github/workflows/release.yml@refs/heads/main`, and the token's issuer, `https://token.actions.githubusercontent.com`. The signature is recorded in Rekor, Sigstore's public transparency log, and stored in GHCR next to the image.
+3. `actions/attest` creates a [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance) attestation for the same digest: the repo, workflow, commit and run that built it, signed the same keyless way. It is stored through the GitHub attestations API and pushed to GHCR next to the image.
+
+If either step fails, the job fails and the `release` job is skipped, so no tag and no Release exist for an image that is not signed and attested.
+
+To verify an image yourself, log Docker in to GHCR first. The package is private, and cosign and `gh` both read Docker's registry credentials. The token needs `read:packages`, which `gh auth login` does not grant by default and `gh auth refresh --scopes read:packages` adds. Then, with cosign 3 on PATH:
+
+```bash
+gh auth token | docker login ghcr.io --username "$(gh api user --jq .login)" --password-stdin
+
+# The signature: made by release.yml on main, with a GitHub OIDC identity.
+cosign verify \
+  --certificate-identity https://github.com/sela27/sample-nodejs/.github/workflows/release.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/sela27/sample-nodejs:1.1.0
+
+# The provenance: built by the same workflow on main, on a GitHub-hosted runner.
+gh attestation verify oci://ghcr.io/sela27/sample-nodejs:1.1.0 \
+  --repo sela27/sample-nodejs \
+  --cert-identity https://github.com/sela27/sample-nodejs/.github/workflows/release.yml@refs/heads/main \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --deny-self-hosted-runners
+```
+
+Use any Release from 1.1.0 on, or `ghcr.io/sela27/sample-nodejs@sha256:<digest>` for the exact image a pod runs. Both commands check the signature over the digest, the certificate chain up to Sigstore's root, and that the identity and issuer match exactly. An image signed by another workflow, another branch, a fork or a pull request run fails, and so does one with no signature at all. 1.0.0 predates signing, so both commands fail on it: `cosign verify` with `no signatures found`, and `gh attestation verify` with HTTP 404, because no attestation exists for its digest.
+
+**Why the pinned cosign binary, not `sigstore/cosign-installer`.** It is the same pattern as Trivy: the job downloads `cosign-linux-amd64` from the v3.1.4 release through the GitHub API and checks it against a pinned SHA-256 before it runs, with no extra action in a job that holds `packages: write` and `id-token: write`. 3.1.4 is the latest release and a GitHub immutable release. `gh release verify v3.1.4 -R sigstore/cosign` checks its release attestation, and the pinned SHA-256 matches both the release's `cosign_checksums.txt` and the asset digest GitHub reports for it.
+
+**Why `actions/attest`, not `actions/attest-build-provenance`.** Since v4, `attest-build-provenance` is only a wrapper around `actions/attest`, which makes build provenance by default, and its README points new workflows to `actions/attest`. The action runs with `create-storage-record: false`, because GitHub creates artifact storage records only for repos owned by an organization.
+
+Nothing checks the signature at deploy time yet. Verifying it at admission, with Kyverno or the Sigstore policy controller, is a next step.
 
 ## Bump commit
 
@@ -388,3 +425,4 @@ Each security control in the delivery path, where it is enforced, and what it st
 | Registry pull secret outside git | ServiceAccount `imagePullSecrets` by name; the secret is created at Bootstrap ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)) | The `read:packages` token reaching the repo. |
 | Secret scanning | The `secrets` check on every PR (gitleaks), required on `main` by the ruleset | A PR that carries a credential, in any of its commits, from merging into `main`. The check cannot unpublish a secret that was already pushed, so a finding also means rotating it. GitHub push protection, enabled on this repo, is an extra layer in front: it refuses a push that carries a known provider's token format, while gitleaks also catches generic high-entropy keys. |
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
+| Signed image with build provenance | The release `image` job: a keyless cosign signature and an `actions/attest` SLSA provenance attestation on the pushed digest ([Image signature and provenance](#image-signature-and-provenance)) | An image that this repo's release workflow on `main` did not build passing as a Release: one pushed by hand, swapped behind a tag, or built by a fork or a PR run fails `cosign verify` and `gh attestation verify`. The cluster does not check it yet. |
