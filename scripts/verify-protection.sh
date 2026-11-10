@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Checks that main is protected the way the spec says, by reading the live repo
-# state through `gh api`: the protect-main ruleset and the repo merge settings.
-# Prints PASS or FAIL per check and exits non-zero if any check fails.
+# state through `gh api`: the protect-main ruleset, the repo's deploy keys and
+# the repo merge settings. Prints PASS or FAIL per check and exits non-zero if
+# any check fails.
 #
 # scripts/protect-main.sh applies what this script checks. The expected values
 # come from the spec, not from that script, so a wrong edit there shows up here.
 # The one list read from the repo is the PR jobs in .github/workflows/pr.yml,
 # because every PR job is a required check under its job id.
 #
-# Needs gh, logged in as a user who can push to the repo, because GitHub hides
-# the merge settings from everyone else. Runs from Git Bash on Windows and
-# natively on Linux and macOS.
+# Needs gh, logged in as an admin of the repo, because GitHub shows the deploy
+# keys only to admins and the merge settings only to users who can push. Runs
+# from Git Bash on Windows and natively on Linux and macOS.
 #
 # Variables (same default as protect-main.sh):
 #   GH_REPO  repository to check, as owner/name (default: sela27/sample-nodejs)
@@ -21,6 +22,10 @@ GH_REPO="${GH_REPO:-sela27/sample-nodejs}"
 RULESET_NAME="protect-main"
 # GitHub Actions' app id. Each required check must come from a workflow job.
 GITHUB_ACTIONS_APP_ID="15368"
+# The deploy key the release workflow pushes the Bump commit with. It must be
+# the repo's only deploy key, because a ruleset bypass for deploy keys names no
+# key: it lets every deploy key of the repo through.
+DEPLOY_KEY_TITLE="bump-commit"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PR_WORKFLOW="$REPO_ROOT/.github/workflows/pr.yml"
@@ -85,7 +90,7 @@ if [[ -n "$ruleset_id" ]]; then
     "merge_methods=\(rule("pull_request").parameters.allowed_merge_methods // [] | sort | join(" "))",
     "checks=\(checks | map(.context) | sort | join(" "))",
     "checks_not_from_actions=\(checks | map(select(.integration_id != '"$GITHUB_ACTIONS_APP_ID"') | .context) | words)",
-    "bypass_not_deploy_key=\(.bypass_actors // [] | map(select(.actor_type != "DeployKey") | .actor_type) | words)",
+    "bypass=\(.bypass_actors // [] | map("\(.actor_type):\(.bypass_mode)") | sort | words)",
     "current_user_can_bypass=\(.current_user_can_bypass)"
   ' | tr -d '\r')"
 fi
@@ -112,7 +117,13 @@ expect "every required check must come from GitHub Actions (app $GITHUB_ACTIONS_
   "$(field checks_not_from_actions "$ruleset")"
 has_rule "force-push is blocked" non_fast_forward
 has_rule "deletion is blocked" deletion
-expect "nothing but a deploy key may bypass the ruleset" "none" "$(field bypass_not_deploy_key "$ruleset")"
+# The Bump commit's deploy key is the one way past the ruleset. The bypass
+# entry for deploy keys covers all of them, so the repo must hold that key
+# alone, with the write access the push needs.
+expect "only deploy keys may bypass the ruleset, always" "DeployKey:always" "$(field bypass "$ruleset")"
+expect "the only deploy key is '$DEPLOY_KEY_TITLE', with write access" "$DEPLOY_KEY_TITLE:write" \
+  "$(gh api --paginate "repos/$GH_REPO/keys" \
+    --jq '.[] | "\(.title):\(if .read_only then "read-only" else "write" end)"' | tr -d '\r' | sort | paste -sd ' ' -)"
 expect "the gh user cannot bypass the ruleset" "never" "$(field current_user_can_bypass "$ruleset")"
 
 # The repo merge settings. GitHub returns them only to a token that can push.

@@ -57,6 +57,7 @@ npm test
 
 - `test/app.test.js` sends requests with supertest to the exported Express app in-process. It checks the status and body of `/my-app`, `/about`, `/ready`, `/live` and `/classified`, a 404 for an unknown path, and the `/metrics` contract: Prometheus content type, `root_access_total` present, and its value going up by one after a request to `/my-app`.
 - `test/entrypoint.test.js` checks that loading `app.js` does not open a port, and that `node app.js` listens on `PORT` (default 8080) and prints `Server running on port <PORT>`.
+- `test/bump-dev-image-tag.test.js` runs `scripts/bump-dev-image-tag.sh` with bash against a copy of the dev values ([Bump commit](#bump-commit)). On Windows, run `npm test` from Git Bash.
 
 supertest is a dev dependency only; the app does not need it at runtime.
 
@@ -143,7 +144,7 @@ A StatefulSet gives stable pod names, ordered start and stop, and a PersistentVo
 - `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the name of the registry pull secret, the Ingress class, the list of Public paths and the Ingress TLS flag, off. An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
 - `values-dev.yaml` holds what the dev Environment adds: the image repository `ghcr.io/sela27/sample-nodejs`, the image tag, and the host `sample-nodejs.127.0.0.1.nip.io`. nip.io resolves that name to 127.0.0.1, where `minikube tunnel` exposes Traefik, so no hosts-file edit is needed.
 - The chart refuses to render without an image repository, an image tag, a host and a pull secret name, or with Ingress TLS on and no ClusterIssuer, so a missing value fails at render time, not in the cluster.
-- The dev image tag is `0.0.0-placeholder` for now. No Release exists yet, so no image carries a real version. From the first Release on, the Bump commit is the only writer of `image.tag` in `values-dev.yaml`, and it always writes a Release version. No manifest uses `latest`.
+- The dev image tag is a Release version, `1.0.0` at first, seeded by hand. From then on the [Bump commit](#bump-commit) is the only writer of `image.tag` in `values-dev.yaml`, and it always writes a Release version. No manifest uses `latest`.
 - Adding an Environment means adding a `values-<environment>.yaml` and an ArgoCD Application for it, with no chart change.
 
 Chart changes are `chore(chart)` commits, so they never produce a Release. They reach the cluster through ArgoCD, which renders the chart straight from git. For the same reason the chart's own `version` is never published or bumped; the version that matters is the image tag.
@@ -278,7 +279,7 @@ KSV-0014 (HIGH): Container 'app' of Deployment 'sample-nodejs-dev' should set 's
 - Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate` and in the release `image` job, helm and Trivy in `iac-gate`) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
 - gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
 - Each workflow's default token permission is `contents: read` and nothing else. A job that needs more asks for it in its own `permissions:` block. Only the release workflow does, as listed in [Release flow](#release-flow).
-- `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps.
+- `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps. The one exception is the release `bump` job, which keeps its deploy key configured for its own push. No other action runs in that job, and checkout's post step removes the key.
 - `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
 - A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
 
@@ -295,13 +296,14 @@ A squash merge into `main` becomes one commit, and its message is the PR title, 
 
 The first Release is 1.0.0, whatever the type. Only changes to the app or its production dependencies use `feat` or `fix`. Chart, cluster, CI, build, test and docs changes use the other types, so they never ship a new image.
 
-The run has three jobs. Each one starts only if the one before it succeeded:
+The run has four jobs. Each one starts only if the one before it succeeded:
 
-1. **`version`** runs semantic-release in dry-run mode (`release/next-version.mjs`). It reads the commits since the last `v*` tag, logs a verdict for each commit and the release notes it would publish, and creates nothing. If no commit warrants a Release, it logs `No Release from this commit`, and the run ends there, green, with the other two jobs skipped.
+1. **`version`** runs semantic-release in dry-run mode (`release/next-version.mjs`). It reads the commits since the last `v*` tag, logs a verdict for each commit and the release notes it would publish, and creates nothing. If no commit warrants a Release, it logs `No Release from this commit`, and the run ends there, green, with the other three jobs skipped.
 2. **`image`** builds the image with BuildKit, tagged with the version and with `sha-<short commit>`. It then runs the image Gate on it, with the same pinned Trivy 0.76.2, flags and `.trivyignore` as the `image-gate` PR check. Only then does it log in to GHCR and push both tags to the private package `ghcr.io/sela27/sample-nodejs`. The scan runs again on `main` because a vulnerability can be published between the PR check and the merge.
 3. **`release`** runs semantic-release for real. It tags the commit `v<version>`, pushes the tag, and creates the GitHub Release with the notes. A last step checks that the tag exists. semantic-release exits 0 without releasing when `main` has moved on since the run started, and the run must not look green when an image was pushed without its Release.
+4. **`bump`** makes the [Bump commit](#bump-commit): it sets the dev image tag to the version and pushes that one-line change to `main` with the deploy key. ArgoCD deploys it from there.
 
-**A Gate failure leaves nothing behind.** When the scan fails, the `image` job stops at that step. Its login and push steps show as skipped, so nothing reaches GHCR. The `release` job is skipped as well, so no tag and no GitHub Release are created. The job order guarantees this. The job that creates the tag starts only after the job that pushes, and that job pushes only after the scan passes.
+**A Gate failure leaves nothing behind.** When the scan fails, the `image` job stops at that step. Its login and push steps show as skipped, so nothing reaches GHCR. The `release` and `bump` jobs are skipped as well, so no tag, no GitHub Release and no Bump commit are created. The job order guarantees this. The job that creates the tag starts only after the job that pushes, and that job pushes only after the scan passes.
 
 **Job permissions.** The workflow default is `contents: read`. Each job raises only what it uses, and no job gets `issues`, `pull-requests`, `id-token` or `attestations`.
 
@@ -310,8 +312,9 @@ The run has three jobs. Each one starts only if the one before it succeeded:
 | `version` | `contents: write` | Before it analyzes anything, semantic-release checks with `git push --dry-run` that it could push the tag, even in dry-run mode. GitHub refuses that check to a read-only token. The job pushes nothing. |
 | `image` | `contents: read`, `packages: write` | Push the image to GHCR. |
 | `release` | `contents: write` | Push the tag and create the GitHub Release. |
+| `bump` | none | The repo is public, so the checkout needs no token, and the push uses the deploy key. |
 
-**One run at a time.** All release runs share one concurrency group, and a run in progress is never cancelled, because a cancelled run could leave an image in GHCR without its Release. A push that lands meanwhile waits. GitHub keeps only the newest waiting run and cancels older waiting ones. That loses nothing, because semantic-release reads every commit since the last Release tag, so the newest run releases them all. The Bump commit will carry `[skip ci]`, so GitHub starts no run for it.
+**One run at a time.** All release runs share one concurrency group, and a run in progress is never cancelled, because a cancelled run could leave an image in GHCR without its Release. A push that lands meanwhile waits. GitHub keeps only the newest waiting run and cancels older waiting ones. That loses nothing, because semantic-release reads every commit since the last Release tag, so the newest run releases them all. The Bump commit carries `[skip ci]`, so GitHub starts no run for it.
 
 **The semantic-release config**, in `.releaserc.yaml`:
 
@@ -349,6 +352,33 @@ GITHUB_TOKEN="$(gh auth token)" node release/next-version.mjs
 
 Run it only on `main`. On any other branch, semantic-release force-updates the local `main` from GitHub before it declines to release.
 
+## Bump commit
+
+After each Release, the `bump` job in `.github/workflows/release.yml` points the dev Environment at the new image. It changes one line, `image.tag` in `gitops/charts/sample-nodejs/values-dev.yaml`, commits it as `chore(release): deploy <version> to dev [skip ci]`, and pushes it straight to `main`. ArgoCD sees the new tag in git and deploys it. The pipeline never reaches the cluster.
+
+1. It checks out `main` as it is now, not the released commit, so the Bump commit lands on top of anything merged since. The checkout goes over SSH with the deploy key.
+2. `scripts/bump-dev-image-tag.sh <version>` sets the tag. It accepts only `MAJOR.MINOR.PATCH`, such as `1.2.3`, with no leading `v`. It also fails unless the values file has exactly one `tag:` line under `image:`, so a reshaped file cannot leave nothing to commit while dev stays on the old image. On any failure the file is left as it was.
+3. It commits and pushes. If the push is refused because `main` moved on since the checkout, the job rebases the commit onto the new `main` and pushes once more. Any other refusal fails the job. A re-run after a successful push finds the tag already set and stops green with nothing to commit.
+
+**No new run.** GitHub starts no workflow for a push whose head commit says `[skip ci]`. The commit is also a `chore`, so semantic-release never counts it toward a Release.
+
+**Why a deploy key.** The `protect-main` ruleset requires a PR for every change to `main`, so the push needs something on its bypass list. That is a deploy key, used by this one job. The other way would be to put the GitHub Actions app on the list. Then every job with a `contents: write` token could push to `main` without a PR, the `release` job among them, which runs some 300 npm packages. With the key, the `bump` job needs no write token either: its job token has no permissions at all.
+
+**The key.** An ed25519 key generated for this purpose only. Its public half is the repo's deploy key `bump-commit`, with write access. Its private half is the Actions secret `DEPLOY_KEY`, which only the `bump` job reads. No other copy exists. To rotate it, or to recreate it, generate a new key in a temp directory, swap it in and delete the local copy:
+
+```bash
+gh repo deploy-key list                       # the id of the old bump-commit key
+gh repo deploy-key delete <old id>
+dir="$(mktemp -d)"
+ssh-keygen -q -t ed25519 -N "" -C bump-commit -f "$dir/bump-commit"
+gh repo deploy-key add "$dir/bump-commit.pub" --title bump-commit --allow-write
+gh secret set DEPLOY_KEY < "$dir/bump-commit"   # read from the file, never printed
+rm -rf "$dir"
+scripts/verify-protection.sh
+```
+
+`test/bump-dev-image-tag.test.js` runs the script against a copy of the dev values in the `test` check. It checks that the diff is exactly the tag line, that a malformed version fails and leaves the file unchanged, and that a file without the tag fails. Local branches need a `git pull` after each Release, because the Bump commit lands in the same history as code commits ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)).
+
 ## Branch protection
 
 `main` is protected by a repository ruleset named `protect-main`, and the repo allows squash merges only. `scripts/protect-main.sh` applies both through `gh api`, so the protection is reproducible and reviewable as code. `scripts/verify-protection.sh` reads the live settings back from GitHub and prints PASS or FAIL for each rule. Both need `gh`; applying needs a repo admin.
@@ -361,9 +391,9 @@ scripts/verify-protection.sh    # check what GitHub actually enforces
 The ruleset applies to `refs/heads/main` and is active:
 
 - **A pull request is required**, with zero approvals, because there is a single maintainer. The checks are the review. The ruleset itself also allows squash merges only.
-- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate` and `iac-gate`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit will land on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
+- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate` and `iac-gate`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
 - **Force-push and deletion of `main` are blocked.**
-- **Nobody can bypass it**, the repo admin included: the bypass list is empty. The Bump commit will be the one exception. The pipeline pushes it with a deploy key that goes on the bypass list ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)), added through the same script.
+- **Only the Bump commit's deploy key can bypass it**, and nobody else, the repo admin included. The bypass list holds one entry, deploy keys in `always` mode, so the pipeline can push the [Bump commit](#bump-commit) without a PR ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)). GitHub's deploy key bypass names no single key: it covers every deploy key of the repo. So `bump-commit` must stay the repo's only deploy key, and `scripts/verify-protection.sh` fails if another one appears. `always` records each bypass in the rule insights, where `exempt` would skip the rules without a trace.
 
 The repo merge settings:
 
