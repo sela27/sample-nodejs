@@ -9,3 +9,7 @@ docs/agents/
 
 # Assignment text (kept locally, not published)
 DevOps-Task-K8S.md
+
+# SonarQube scanner work dir and the coverage report the sast jobs write
+.scannerwork/
+lcov.info

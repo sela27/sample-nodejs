@@ -12,6 +12,6 @@
 
 - [x] Dependabot config covers npm, docker and github-actions on a weekly schedule. Updates to SHA-pinned actions keep the version comment.
 - [x] Commit prefixes: production npm dependencies use `fix(deps)` (a security bump produces a Release). Dev dependencies, the base image and actions use `chore(deps)` or `ci(deps)`.
-- [ ] Dependabot PRs can run the SAST Gate: `SONAR_TOKEN` is available as a Dependabot secret, because Dependabot PRs cannot read regular Actions secrets. (Completes with ticket 07: `SONAR_TOKEN` does not exist until the SonarQube Cloud setup there, and adding it as a Dependabot secret is a human step.)
+- [x] Dependabot PRs can run the SAST Gate: `SONAR_TOKEN` is available as a Dependabot secret, because Dependabot PRs cannot read regular Actions secrets. (Completed with ticket 07 on 2026-11-11: the human's SonarQube Cloud setup stored the token as an Actions secret and as a Dependabot secret, both named `SONAR_TOKEN`; `gh secret list --app dependabot` lists it.)
 - [x] The README security-controls list includes Dependabot.
 - [x] PR title is `chore: …`. Status set to `done` in the same PR.
