@@ -613,6 +613,10 @@ The `v1.1.0` Release, with the SBOM among its assets:
   gh api -X PUT repos/sela27/sample-nodejs/automated-security-fixes
   ```
 
+- **Alerts with no update to take** are dismissed with their reason, not left open. Both alerts so far are in packages that the npm CLI bundles inside its own tarball. semantic-release installs the npm CLI through its `@semantic-release/npm` plugin, which `.releaserc.yaml` never loads, so no release run executes that code. npm `overrides` cannot replace a bundled package; only a newer npm can.
+  - Alert 1, [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) in glob 13.0.6. GitHub's own rule for low-impact alerts in development dependencies dismissed it on 2026-11-10.
+  - Alert 2, [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (medium, a denial of service through crafted glob patterns) in minimatch 10.2.5. Dismissed on 2026-11-11 as "vulnerable code not used". The fix is in minimatch 11.0.1, and even the latest npm, 12.2.2, still bundles minimatch 10.
+
 - **Secrets.** A workflow run that Dependabot triggers gets a read-only token and only the repo's Dependabot secrets, never its Actions secrets. Of the required checks only `sast` needs a secret, `SONAR_TOKEN`, so it is stored under both ([SAST Gate](#sast-gate)).
 - **Not covered.** Dependabot does not read the versions pinned with a SHA-256 in the workflows (helm, kubeconform, yq, gitleaks, Trivy, cosign), the Traefik and ArgoCD chart versions, or the tool versions in the README. Those are bumped by hand.
 
