@@ -1,0 +1,231 @@
+# Monitoring (ticket 30): kube-prometheus-stack, installed by ArgoCD from the
+# prometheus-community Helm chart, trimmed to what this cluster needs. The
+# operator, one Prometheus and Grafana. Prometheus scrapes the app through the
+# app's own ServiceMonitor (serviceMonitor.enabled in values-dev.yaml) and
+# nothing else. Grafana shows one dashboard, provisioned from this file.
+#
+# Everything a full install adds for watching the cluster itself stays off:
+# Alertmanager, node-exporter, kube-state-metrics, the default alerting rules
+# and dashboards, and the scrapes of the control plane and the kubelet. The
+# minikube node has 4 GiB, of which the cluster already used about 2.8 GiB;
+# the README records the memory used after this install.
+#
+# Grafana has no Ingress. Reach it with a port-forward (see the README). Its
+# admin password is the Secret monitoring/grafana-admin, which Bootstrap
+# creates with a random password, so no password is in git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  # Deleting this Application (or removing this file from git) also deletes
+  # the resources it created. The CRDs stay: Helm never deletes a chart's CRDs.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    # Chart 93.1.2 ships Prometheus Operator v0.95.2 and Grafana chart 14.4.1.
+    targetRevision: 93.1.2
+    helm:
+      # The release name is also the label Prometheus selects ServiceMonitors
+      # by (release: kube-prometheus-stack), which values-dev.yaml sets.
+      releaseName: kube-prometheus-stack
+      valuesObject:
+        defaultRules:
+          create: false
+        alertmanager:
+          enabled: false
+        nodeExporter:
+          enabled: false
+        kubeStateMetrics:
+          enabled: false
+        windowsMonitoring:
+          enabled: false
+        kubeApiServer:
+          enabled: false
+        kubelet:
+          enabled: false
+        kubeControllerManager:
+          enabled: false
+        coreDns:
+          enabled: false
+        kubeDns:
+          enabled: false
+        kubeEtcd:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeProxy:
+          enabled: false
+
+        prometheusOperator:
+          # The admission webhook only validates rule and config objects, of
+          # which this install has none. Without it, no certificate jobs run as
+          # Helm hooks on every sync, and the operator needs no TLS.
+          admissionWebhooks:
+            enabled: false
+          tls:
+            enabled: false
+          serviceMonitor:
+            selfMonitor: false
+          resources:
+            requests:
+              cpu: 10m
+              memory: 48Mi
+            limits:
+              memory: 128Mi
+          # The operator adds this container to the Prometheus pod; it reloads
+          # Prometheus when its configuration changes. It uses about 16 MiB.
+          prometheusConfigReloader:
+            resources:
+              requests:
+                cpu: 5m
+                memory: 16Mi
+              limits:
+                memory: 48Mi
+
+        prometheus:
+          serviceMonitor:
+            selfMonitor: false
+          prometheusSpec:
+            # A demo cluster: six hours of data in an emptyDir is enough.
+            retention: 6h
+            resources:
+              requests:
+                cpu: 50m
+                memory: 192Mi
+              limits:
+                memory: 384Mi
+
+        grafana:
+          defaultDashboardsEnabled: false
+          serviceMonitor:
+            enabled: false
+          testFramework:
+            enabled: false
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+          # Anyone who can port-forward to Grafana can view without logging in.
+          # That already takes cluster credentials, and a viewer cannot change
+          # anything. Changes need the admin password.
+          grafana.ini:
+            auth.anonymous:
+              enabled: true
+              org_role: Viewer
+          # Grafana 13 holds about 270 MiB once started, before any page cache.
+          # Under a 256 MiB limit it was OOM-killed on every start.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 288Mi
+            limits:
+              memory: 512Mi
+          sidecar:
+            # The dashboard comes from this file, so no sidecar watches for
+            # dashboard ConfigMaps. The datasource sidecar stays: it loads the
+            # Prometheus datasource the chart generates.
+            dashboards:
+              enabled: false
+            # The datasource sidecar holds about 75 MiB of heap, up to 131 MiB
+            # with page cache.
+            resources:
+              requests:
+                cpu: 5m
+                memory: 64Mi
+              limits:
+                memory: 160Mi
+          dashboardProviders:
+            dashboardproviders.yaml:
+              apiVersion: 1
+              providers:
+                - name: default
+                  orgId: 1
+                  folder: ""
+                  type: file
+                  disableDeletion: true
+                  editable: false
+                  options:
+                    path: /var/lib/grafana/dashboards/default
+          dashboards:
+            default:
+              sample-nodejs:
+                json: |
+                  {
+                    "uid": "sample-nodejs",
+                    "title": "sample-nodejs",
+                    "tags": ["sample-nodejs"],
+                    "timezone": "utc",
+                    "schemaVersion": 39,
+                    "refresh": "10s",
+                    "time": { "from": "now-30m", "to": "now" },
+                    "panels": [
+                      {
+                        "id": 1,
+                        "type": "timeseries",
+                        "title": "Requests to /my-app, summed across pods",
+                        "description": "sum(root_access_total): the app's counter of GET /my-app, added up over every pod Prometheus scrapes. A pod that restarts starts its counter at zero again.",
+                        "gridPos": { "x": 0, "y": 0, "w": 18, "h": 10 },
+                        "datasource": { "type": "prometheus", "uid": "prometheus" },
+                        "targets": [
+                          { "refId": "A", "expr": "sum(root_access_total)", "legendFormat": "root_access_total (all pods)" }
+                        ],
+                        "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] },
+                        "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+                      },
+                      {
+                        "id": 2,
+                        "type": "stat",
+                        "title": "Total now",
+                        "gridPos": { "x": 18, "y": 0, "w": 6, "h": 5 },
+                        "datasource": { "type": "prometheus", "uid": "prometheus" },
+                        "targets": [ { "refId": "A", "expr": "sum(root_access_total)" } ],
+                        "fieldConfig": {
+                          "defaults": {
+                            "unit": "none",
+                            "decimals": 0,
+                            "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] }
+                          },
+                          "overrides": []
+                        },
+                        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none" }
+                      },
+                      {
+                        "id": 3,
+                        "type": "stat",
+                        "title": "Pods scraped",
+                        "description": "App pods whose last scrape succeeded. Red at 0.",
+                        "gridPos": { "x": 18, "y": 5, "w": 6, "h": 5 },
+                        "datasource": { "type": "prometheus", "uid": "prometheus" },
+                        "targets": [ { "refId": "A", "expr": "count(up{namespace=\"sample-nodejs-dev\"} == 1) or vector(0)" } ],
+                        "fieldConfig": {
+                          "defaults": {
+                            "unit": "none",
+                            "decimals": 0,
+                            "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+                          },
+                          "overrides": []
+                        },
+                        "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none" }
+                      }
+                    ]
+                  }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # Bootstrap creates the namespace (it holds the Grafana admin Secret);
+      # this covers a cluster where it does not exist yet.
+      - CreateNamespace=true
+      # The chart ships the Prometheus Operator's CRDs, some larger than the
+      # last-applied-configuration annotation allows; server-side apply has
+      # no such limit.
+      - ServerSideApply=true

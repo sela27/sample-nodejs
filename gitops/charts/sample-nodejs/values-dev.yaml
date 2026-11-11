@@ -17,3 +17,12 @@ ingress:
   tls:
     enabled: true
     clusterIssuer: selfsigned-issuer
+
+# Prometheus from kube-prometheus-stack (gitops/apps/kube-prometheus-stack.yaml)
+# scrapes /metrics through this ServiceMonitor. It selects ServiceMonitors by
+# its release name, and runs in the namespace that networkPolicy.monitoring
+# admits by default (monitoring).
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
