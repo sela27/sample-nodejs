@@ -528,6 +528,29 @@ unset SONAR_TOKEN
 
 **The app's own check.** The SonarQubeCloud app also posts a check on each PR, `SonarCloud Code Analysis`. It is SonarQube's default quality gate, "Sonar way", applied to the PR's new code: reliability, security and maintainability ratings, 80% coverage, at most 3% duplication, and all security hotspots reviewed. It is not a required check, because `sast` is the Gate. It is still worth reading: on this Gate's own PR it caught two reliability issues in `scripts/sast-gate.js`, a regular expression open to backtracking and an unhandled promise, which were fixed before the merge.
 
+**Demo: the Gate blocking a command injection** (2026-11-11). PR [#39](https://github.com/sela27/sample-nodejs/pull/39) added a `/ping` route that passed a query parameter straight into a shell command:
+
+```js
+app.get('/ping', (req, res) => {
+    exec(`ping -c 1 ${req.query.host}`, ...);   // ?host=x;id runs `id` in the pod
+});
+```
+
+SonarQube Cloud's taint analysis followed the input from `req.query.host` to `exec`. It reported a Vulnerability, not just a Security Hotspot: `jssecurity:S2076`, "Command Injection via unsanitized user input", Blocker in both severity modes. `sast` failed and printed:
+
+```text
+main branch: 8 open vulnerabilities, 0 blocking
+pull request 39: 1 open vulnerability, 1 blocking
+BLOCKING  BLOCKER, SECURITY:BLOCKER  jssecurity:S2076  app.js:46  (pull request 39)
+FAIL: 1 open vulnerability at the top severities. Fix it before merging.
+```
+
+GitHub reported the PR's merge state as `BLOCKED`, and every other required check was green. The PR was closed without merging, and its branch was deleted.
+
+![PR #39: the required sast check fails, next to SonarQube's own Quality Gate check, and the Squash and merge button is disabled](docs/screenshots/08-sast-red-merge-blocked.png)
+
+![SonarQube Cloud shows the issue on PR 39: Command Injection via unsanitized user input, Security impact Blocker, with the flow from the request (source) to exec (sink) at app.js line 46](docs/screenshots/08-sonarqube-issue.png)
+
 `test/sast-gate.test.js` drives the script against a fake Web API in the `test` check:
 
 - A blocking finding, on the PR or on `main`, fails it.
