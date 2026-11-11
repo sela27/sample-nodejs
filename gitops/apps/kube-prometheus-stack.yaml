@@ -77,6 +77,15 @@ spec:
               memory: 48Mi
             limits:
               memory: 128Mi
+          # The operator adds this container to the Prometheus pod; it reloads
+          # Prometheus when its configuration changes. It uses about 16 MiB.
+          prometheusConfigReloader:
+            resources:
+              requests:
+                cpu: 5m
+                memory: 16Mi
+              limits:
+                memory: 48Mi
 
         prometheus:
           serviceMonitor:
@@ -122,6 +131,14 @@ spec:
             # Prometheus datasource the chart generates.
             dashboards:
               enabled: false
+            # The datasource sidecar holds about 75 MiB of heap, up to 131 MiB
+            # with page cache.
+            resources:
+              requests:
+                cpu: 5m
+                memory: 64Mi
+              limits:
+                memory: 160Mi
           dashboardProviders:
             dashboardproviders.yaml:
               apiVersion: 1
