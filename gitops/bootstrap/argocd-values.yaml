@@ -12,12 +12,13 @@ notifications:
   # ArgoCD Notifications are out of scope.
   enabled: false
 
-# Time to fetch a Helm chart. Pulling from a Helm repository first downloads the
-# repository's whole index (kube-prometheus-stack's is about 7 MB). By default,
-# the repo server gives helm 90 seconds and the controller waits 60 seconds for
-# the repo server. On a slow link the pull takes longer than that, and every
-# retry starts over. With five minutes for both, the first pull finishes; after
-# that, ArgoCD serves the rendered manifests from its cache.
+# Time to fetch a Helm chart. Pulling from a Helm repository first downloads
+# the repository's whole index (kube-prometheus-stack's is about 7 MB), then
+# the chart. By default the repo server gives helm 90 seconds for both, and
+# the controller waits 60 seconds for the repo server; on a slow link that cuts
+# the pull short, and every retry starts over. With five minutes for both, the
+# only limit left is helm's own, two minutes per download. After the first
+# pull, ArgoCD serves the rendered manifests from its cache.
 configs:
   params:
     controller.repo.server.timeout.seconds: 300
