@@ -262,9 +262,11 @@ ArgoCD UI: keep this running, then open https://localhost:8080 and log in as
 admin (the certificate is self-signed):
   kubectl --context ${MINIKUBE_PROFILE} -n argocd port-forward service/argocd-server 8080:443
 
-Grafana (no login needed to view): keep this running, then open
-http://localhost:3000/d/sample-nodejs . The admin password, for changes:
+Grafana: keep this running, then open http://localhost:3000/d/sample-nodejs
+(viewing needs no login):
   kubectl --context ${MINIKUBE_PROFILE} -n ${MONITORING_NAMESPACE} port-forward service/kube-prometheus-stack-grafana 3000:80
+
+Grafana admin password (user admin), needed only to change dashboards or settings:
   kubectl --context ${MINIKUBE_PROFILE} -n ${MONITORING_NAMESPACE} get secret ${GRAFANA_ADMIN_SECRET} -o jsonpath='{.data.admin-password}' | base64 -d; echo
 
 Ingress on localhost: in a separate terminal, run this and keep it running
