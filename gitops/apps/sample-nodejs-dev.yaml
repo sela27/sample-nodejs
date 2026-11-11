@@ -37,3 +37,12 @@ spec:
       # ArgoCD creates it, without the labels or the pull secret, and a re-run
       # of Bootstrap adds both.
       - CreateNamespace=true
+    # Retries a failed sync, such as the ServiceMonitor arriving before
+    # kube-prometheus-stack has installed its CRD: 15 times, 10 s apart at
+    # first, doubling up to 3 minutes, so for about half an hour in all.
+    retry:
+      limit: 15
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

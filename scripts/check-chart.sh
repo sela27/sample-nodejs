@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Chart Gate: lints the Helm chart, renders it with the dev values (once as
-# is, which has Ingress TLS on, once with Ingress TLS off, once with TLS on and
-# another issuer, once with the ServiceMonitor on), validates the rendered manifests against the
+# is, which has Ingress TLS and the ServiceMonitor on, once with Ingress TLS
+# off, once with TLS on and another issuer, once with the ServiceMonitor on
+# and other values, once with it off), validates the rendered manifests against the
 # Kubernetes schemas, and checks what the rendered manifests promise: only the
 # Public paths behind the Ingress, probes on the app's health endpoints, the
 # ports, the pod hardening, the ServiceAccount, the app configuration and its
@@ -12,7 +13,7 @@
 # TLS flag adds the TLS section and the cert-manager issuer annotation and
 # nothing else, and that the ServiceMonitor flag, off by default, adds only a
 # ServiceMonitor for /metrics and the monitoring namespace as a second peer of
-# the NetworkPolicy.
+# the NetworkPolicy, and that dev has it on for kube-prometheus-stack.
 #
 # The `chart` job in .github/workflows/pr.yml runs this script, so a local run
 # checks exactly what CI checks. Prints PASS or FAIL per check and exits
@@ -42,8 +43,9 @@ TLS_ISSUER="check-chart-issuer"
 TLS_OFF=(--set ingress.tls.enabled=false)
 TLS_ON=(--set ingress.tls.enabled=true --set-string "ingress.tls.clusterIssuer=$TLS_ISSUER")
 
-# The ServiceMonitor is off by default. A third render turns it on with values
-# that differ from the defaults, so the checks show that the values reach the
+# The ServiceMonitor is off by default, and the dev values turn it on for
+# kube-prometheus-stack. A third render turns it on with values that differ
+# from the defaults and from dev, so the checks show that the values reach the
 # objects: a Prometheus selector label (kube-prometheus-stack matches on
 # `release`), a scrape interval and a monitoring namespace.
 SM_LABEL_KEY="release"
@@ -569,8 +571,8 @@ expect "NetworkPolicy port is the container port" "$CONTAINER_PORT" \
   "$(container_port_number "$(q "$np_rule | .ports[0].port")")"
 expect "NetworkPolicy port protocol" "TCP" "$(q "$np_rule | .ports[0].protocol // \"TCP\"")"
 expect "NetworkPolicy port is not a range" "no endPort" "$(q "$np_rule | .ports[0].endPort // \"no endPort\"")"
-expect "NetworkPolicy admits only Traefik's pods in the $TRAEFIK_NAMESPACE namespace" "$TRAEFIK_PEER" \
-  "$(q "[$np_rule | .from[]] | sort_keys(..) | to_json(0)")"
+expect "NetworkPolicy's first peer is Traefik's pods in the $TRAEFIK_NAMESPACE namespace" "$TRAEFIK_PEER" \
+  "$(q "[$np_rule | .from[0]] | sort_keys(..) | to_json(0)")"
 
 # Ingress TLS on (ingress.tls.enabled). cert-manager sees the issuer
 # annotation, issues a certificate for the host in the TLS section and stores
@@ -608,12 +610,38 @@ expect "TLS on: TLS secret name is set" "set" \
 expect "TLS on: Ingress annotations" "cert-manager.io/cluster-issuer=$TLS_ISSUER" \
   "$(q_tls "[$ingress | .metadata.annotations // {} | to_entries | .[] | .key + \"=\" + .value] | join(\" \")")"
 
-# The ServiceMonitor (serviceMonitor.enabled), off by default, so the cluster
+# The ServiceMonitor (serviceMonitor.enabled), off by default, so a cluster
 # needs no monitoring CRDs. Off, nothing changes: no ServiceMonitor, and the
-# NetworkPolicy keeps its one peer, Traefik.
+# NetworkPolicy admits only Traefik's pods.
 servicemonitor='select(.kind == "ServiceMonitor")'
-expect "ServiceMonitor off: no ServiceMonitor" "0" "$(q "[$servicemonitor] | length")"
-expect "ServiceMonitor off: the NetworkPolicy has one peer" "1" "$(q "[$np_rule | .from[]] | length")"
+sm_off_rendered="$tmp_dir/sm-off.yaml"
+sm_off_ok=false
+if render_with sm-off --set serviceMonitor.enabled=false; then
+  sm_off_ok=true
+  expect "ServiceMonitor off: no ServiceMonitor" "0" "$(qf "$sm_off_rendered" "[$servicemonitor] | length")"
+  expect "ServiceMonitor off: the NetworkPolicy admits only Traefik's pods" "$TRAEFIK_PEER" \
+    "$(qf "$sm_off_rendered" "[$np_rule | .from[]] | sort_keys(..) | to_json(0)")"
+fi
+
+# The dev Environment has it on, for the kube-prometheus-stack Application:
+# the ServiceMonitor carries the label that Application's Prometheus selects
+# by (its Helm release name), and the NetworkPolicy admits the namespace it
+# deploys into. Both are read from the Application, so renaming or moving it
+# without updating the dev values fails here.
+KPS_APP="$REPO_ROOT/gitops/apps/kube-prometheus-stack.yaml"
+KPS_NAMESPACE="$(yq '.spec.destination.namespace' "$KPS_APP" | tr -d '\r')"
+KPS_RELEASE="$(yq '.spec.source.helm.releaseName' "$KPS_APP" | tr -d '\r')"
+expect "dev: one ServiceMonitor" "1" "$(q "[$servicemonitor] | length")"
+expect "dev: the ServiceMonitor has the label kube-prometheus-stack's Prometheus selects" "$KPS_RELEASE" \
+  "$(q "$servicemonitor | .metadata.labels.release")"
+expect "dev: the NetworkPolicy has two peers" "2" "$(q "[$np_rule | .from[]] | length")"
+expect "dev: the second peer is the $KPS_NAMESPACE namespace" \
+  "[{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"$KPS_NAMESPACE\"}}}]" \
+  "$(q "[$np_rule | .from[1]] | sort_keys(..) | to_json(0)")"
+# ArgoCD syncs the app and kube-prometheus-stack in parallel. Until the CRD
+# exists, this annotation lets the dry run pass, and the sync retries.
+expect "dev: ArgoCD skips the ServiceMonitor's dry run while its CRD is missing" "SkipDryRunOnMissingResource=true" \
+  "$(q "$servicemonitor | .metadata.annotations.\"argocd.argoproj.io/sync-options\"")"
 
 # On, the ServiceMonitor tells a Prometheus Operator to scrape /metrics on the
 # Service's named port, and the NetworkPolicy admits the monitoring namespace
@@ -649,11 +677,13 @@ expect "ServiceMonitor on: the NetworkPolicy port is the container port" "$CONTA
   "$(container_port_number "$(q_sm "$networkpolicy | .spec.ingress[0].ports[0].port")" "$sm_rendered")"
 
 # The flag adds the ServiceMonitor and the second peer, nothing else: without
-# them, the render is the default one, object for object.
-without_sm='select(.kind != "ServiceMonitor") | with(select(.kind == "NetworkPolicy"); del(.spec.ingress[0].from[1]))'
-sm_diff="$(diff <(yq "$without_sm" "$rendered") <(yq "$without_sm" "$sm_rendered") || true)"
-expect "ServiceMonitor on: only the ServiceMonitor and the monitoring peer are added" "no other change" \
-  "$([[ -z "$sm_diff" ]] && echo "no other change" || echo "${sm_diff//$'\n'/ | }")"
+# them, the render is the one with the flag off, object for object.
+if $sm_off_ok; then
+  without_sm='select(.kind != "ServiceMonitor") | with(select(.kind == "NetworkPolicy"); del(.spec.ingress[0].from[1]))'
+  sm_diff="$(diff <(yq "$without_sm" "$sm_off_rendered") <(yq "$without_sm" "$sm_rendered") || true)"
+  expect "ServiceMonitor on: only the ServiceMonitor and the monitoring peer are added" "no other change" \
+    "$([[ -z "$sm_diff" ]] && echo "no other change" || echo "${sm_diff//$'\n'/ | }")"
+fi
 
 # With the namespace values left at their defaults.
 if render_with sm-defaults --set serviceMonitor.enabled=true; then

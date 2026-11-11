@@ -5,6 +5,11 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: {{ include "sample-nodejs.fullname" . }}
+  annotations:
+    # ArgoCD may sync this before kube-prometheus-stack has installed the
+    # ServiceMonitor CRD. Skipping the dry run lets the rest of the release
+    # sync, and the Application's retry applies this once the CRD exists.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
   labels:
     {{- include "sample-nodejs.labels" . | nindent 4 }}
     {{- with .Values.serviceMonitor.labels }}

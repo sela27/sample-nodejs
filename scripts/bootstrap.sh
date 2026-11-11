@@ -42,6 +42,11 @@ APP_NAMESPACE="sample-nodejs-dev"
 # (image.pullSecret in gitops/charts/sample-nodejs/values.yaml).
 PULL_SECRET="ghcr-pull"
 REGISTRY="ghcr.io"
+# Grafana's admin login, by the name gitops/apps/kube-prometheus-stack.yaml
+# gives as grafana.admin.existingSecret, in the namespace Prometheus and Grafana
+# run in.
+MONITORING_NAMESPACE="monitoring"
+GRAFANA_ADMIN_SECRET="grafana-admin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -189,6 +194,34 @@ data:
     k apply --server-side --force-conflicts --field-manager=bootstrap -f -
 )
 
+# Grafana's admin login. Like the pull secret, it is created here and not kept
+# in git, so no password is in the repo. The password is random and set only
+# when the Secret does not exist yet, so a re-run keeps it. It reaches kubectl
+# on stdin and is never printed; the README shows how to read it back.
+create_grafana_admin_secret() (
+  set +x
+  k create namespace "$MONITORING_NAMESPACE" --dry-run=client -o yaml | k apply -f - >/dev/null
+  if k -n "$MONITORING_NAMESPACE" get secret "$GRAFANA_ADMIN_SECRET" >/dev/null 2>&1; then
+    log "Keeping the existing Grafana admin Secret ${GRAFANA_ADMIN_SECRET} in namespace ${MONITORING_NAMESPACE}"
+    return 0
+  fi
+  log "Creating the Grafana admin Secret ${GRAFANA_ADMIN_SECRET} in namespace ${MONITORING_NAMESPACE} (random password, not shown)"
+  local password
+  # head reads a fixed number of bytes, so no stage of the pipe is cut short.
+  password="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)"
+  printf 'apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+stringData:
+  admin-user: admin
+  admin-password: %s
+' "$GRAFANA_ADMIN_SECRET" "$MONITORING_NAMESPACE" "$password" |
+    k apply -f - >/dev/null
+)
+
 # The committed manifest follows main; GIT_REPO_URL and GIT_REVISION override it.
 apply_root_app() {
   [[ "$GIT_REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || die "GIT_REVISION '${GIT_REVISION}' is not a branch, tag or commit name."
@@ -229,6 +262,11 @@ ArgoCD UI: keep this running, then open https://localhost:8080 and log in as
 admin (the certificate is self-signed):
   kubectl --context ${MINIKUBE_PROFILE} -n argocd port-forward service/argocd-server 8080:443
 
+Grafana (no login needed to view): keep this running, then open
+http://localhost:3000/d/sample-nodejs . The admin password, for changes:
+  kubectl --context ${MINIKUBE_PROFILE} -n ${MONITORING_NAMESPACE} port-forward service/kube-prometheus-stack-grafana 3000:80
+  kubectl --context ${MINIKUBE_PROFILE} -n ${MONITORING_NAMESPACE} get secret ${GRAFANA_ADMIN_SECRET} -o jsonpath='{.data.admin-password}' | base64 -d; echo
+
 Ingress on localhost: in a separate terminal, run this and keep it running
 (it may ask for admin rights, because it binds ports 80 and 443):
   minikube tunnel -p ${MINIKUBE_PROFILE}
@@ -250,6 +288,7 @@ main() {
   install_argocd
   create_app_namespace
   create_pull_secret
+  create_grafana_admin_secret
   apply_root_app
   wait_for_applications
   print_next_steps
