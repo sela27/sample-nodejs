@@ -15,7 +15,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/sela27/sample-nodejs.git
-    targetRevision: chore/30-monitoring-stack
+    targetRevision: main
     path: gitops/charts/sample-nodejs
     helm:
       # Object names start with the release name (sample-nodejs-dev), the
