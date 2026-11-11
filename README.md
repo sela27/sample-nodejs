@@ -803,6 +803,71 @@ total=7381 ok=7348 non200=0 errors=33
 
 Every response was a 200, including those during the Degraded window. The 33 errors are three bursts of exactly 11 timeouts each, at 19:08:33, 19:18:27 and 19:21:49. In each burst, about two seconds' worth of consecutive requests got no answer within the 5-second limit. The bursts do not line up with the rollout. The first came two minutes after Degraded, while nothing was changing. The other two came 7 and 10 minutes after the revert, while the Application sat Healthy. During all three, the cluster recorded no event, no pod or Traefik restart, and no HPA scaling. So the stall was on the workstation's side of the tunnel: either in `minikube tunnel` or in the `nip.io` name lookup that each new connection makes. The loop still exits 1 for these timeouts, and the numbers above are as it printed them.
 
+## Monitoring
+
+`gitops/apps/kube-prometheus-stack.yaml` installs kube-prometheus-stack into the `monitoring` namespace, from the prometheus-community chart pinned at 93.1.2 (Prometheus Operator v0.95.2, Grafana chart 14.4.1). The minikube node has 4 GiB and the cluster already used about 2.8 GiB, so the install is trimmed to three parts: the operator, one Prometheus and Grafana. Alertmanager, node-exporter, kube-state-metrics, the default rules and dashboards, and the scrapes of the control plane and the kubelet are all off. Prometheus scrapes one thing, the app, through its ServiceMonitor ([The ServiceMonitor flag](#the-servicemonitor-flag)), every 30 seconds. It keeps 6 hours of data in an emptyDir, so a new Prometheus pod starts empty. Each part has a memory limit.
+
+Grafana has one dashboard, `sample-nodejs`, provisioned from the Application file. It shows `sum(root_access_total)` over time, the current total, and how many app pods Prometheus scrapes (red at 0). Its times are UTC, like this README. The sum goes up by one for each request to `/my-app`, whichever pod answers it. A pod that is replaced starts its own count at zero, so the sum drops by that pod's count ([Why a Deployment, not a StatefulSet](#why-a-deployment-not-a-statefulset)).
+
+Neither Prometheus nor Grafana has an Ingress. Open Grafana through a port-forward, then [http://localhost:3000/d/sample-nodejs](http://localhost:3000/d/sample-nodejs):
+
+```bash
+kubectl -n monitoring port-forward service/kube-prometheus-stack-grafana 3000:80
+```
+
+Viewing needs no login: anonymous users get the Viewer role, and the port-forward already takes cluster credentials. Changing anything takes the admin login, user `admin`, with the random password that Bootstrap put in the Secret `grafana-admin`:
+
+```bash
+kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+Prometheus's own UI lists the scrape target and its state, under Status, Target health:
+
+```bash
+kubectl -n monitoring port-forward service/kube-prometheus-stack-prometheus 9090:9090
+```
+
+**Checked on minikube** (2026-11-11, UTC), before merge, with `root` and `sample-nodejs-dev` pointed at this branch:
+
+| Time | What happened |
+| --- | --- |
+| 14:56 | ArgoCD synced the new Application and the dev ServiceMonitor. The ServiceMonitor failed for lack of its CRD; the rest of the dev release applied, the NetworkPolicy's monitoring peer included, and the retries began. |
+| 14:56 to 16:50 | ArgoCD could not fetch the chart. GitHub Pages served the repository's 7 MB index at 2 to 50 KB/s that day, against 250 KB/s and more from other sites. The first pulls hit ArgoCD's 60- and 90-second timeouts, raised to five minutes at 15:15 ([Quick start](#quick-start)); later ones hit helm's two minutes per download. |
+| 16:50:02 | A pull got through. The CRDs, the operator, Prometheus and Grafana were created within 25 seconds. |
+| 16:51:43 | `sample-nodejs-dev` synced the ServiceMonitor on its 15th and last retry, 38 minutes into the round. |
+| 16:50 to 20:41 | Grafana restarted 47 times: `OOMKilled` under its first limit, 256 MiB. |
+| 20:50:32 | Grafana restarted with a 512 MiB limit and stayed up. `kube-prometheus-stack`: Synced, Healthy. |
+
+The chart was already in ArgoCD's cache, so the change of limit rendered without fetching it again.
+
+Grafana 13 holds about 270 MiB of heap once started. Run on the node with no Kubernetes limit, the same image settled at 266 MiB of heap and 380 MiB of page cache. Under a 320 MiB limit with `GOMEMLIMIT` at 180 MiB it still held 254 MiB of heap, so the Go runtime cannot squeeze it much below that. The limit is 512 MiB and the request 288 MiB.
+
+Prometheus showed both app pods as targets, `up`, with no scrape error. Fifty requests to `https://sample-nodejs.127.0.0.1.nip.io/my-app` through the tunnel all got 200, and 35 seconds later `sum(root_access_total)` had gone from 7365 to 7415, up by exactly 50. Then `scripts/request-loop.js` ran for 30 minutes at 2 requests a second through the tunnel (`--url http://127.0.0.1/my-app --host sample-nodejs.127.0.0.1.nip.io`) and printed `total=3517 ok=3517 non200=0 errors=0`; the sum went from 7415 to 10932, up by exactly 3517. Over those 30 minutes no monitoring pod restarted. Through the API server's service proxy, Grafana's `/api/health` answered `ok`, the dashboard `sample-nodejs` had its three panels, and the Prometheus datasource pointed at `kube-prometheus-stack-prometheus.monitoring:9090`.
+
+The screenshot below was taken at 22:06 UTC. It shows the end of a second 30-minute run, a flat stretch with no traffic, and a third run starting. Its axis is in the browser's time zone (UTC+2) because the tab still had the dashboard's URL from before it was switched to UTC: 23:40 on the axis is 21:40 UTC. Opened afresh, the dashboard shows UTC.
+
+![Grafana's sample-nodejs dashboard: sum(root_access_total) climbing steadily while the request loop runs, flat while it is stopped, and climbing again; Total now 14628, Pods scraped 2](docs/screenshots/30-grafana-root-access-total.png)
+
+Memory at 20:52, with everything running:
+
+| What | Before the install | After |
+| --- | --- | --- |
+| `docker stats minikube` | 2.81 GiB of 4 GiB | 3.47 GiB of 4 GiB |
+| `kubectl top node` | 2844Mi | 3541Mi |
+| Heap of the whole node (`anon` in the node's `memory.stat`) | | 2.84 GiB |
+
+Both tools count page cache that is in use, which the kernel can still reclaim, so the heap line is the one that can run out. Per container, from `kubectl top pod --containers -n monitoring`:
+
+| Container | Memory | Limit |
+| --- | --- | --- |
+| `grafana` | 471Mi (272 MiB heap, the rest page cache) | 512Mi |
+| `grafana-sc-datasources` | 90Mi | 160Mi |
+| `prometheus` | 60Mi | 384Mi |
+| `config-reloader` | 16Mi | 48Mi |
+| `kube-prometheus-stack` (operator) | 32Mi | 128Mi |
+
+The sidecar and the config-reloader had no limit in the first install: the chart sets none, and the 20:52 readings above are from then. Their limits went in after those readings.
+
 ## Branch protection
 
 `main` is protected by a repository ruleset named `protect-main`, and the repo allows squash merges only. `scripts/protect-main.sh` applies both through `gh api`, so the protection is reproducible and reviewable as code. `scripts/verify-protection.sh` reads the live settings back from GitHub and prints PASS or FAIL for each rule. Both need `gh`; applying needs a repo admin.
