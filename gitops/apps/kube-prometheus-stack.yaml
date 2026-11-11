@@ -108,12 +108,14 @@ spec:
             auth.anonymous:
               enabled: true
               org_role: Viewer
+          # Grafana 13 holds about 270 MiB once started, before any page cache.
+          # Under a 256 MiB limit it was OOM-killed on every start.
           resources:
             requests:
               cpu: 20m
-              memory: 96Mi
+              memory: 288Mi
             limits:
-              memory: 256Mi
+              memory: 512Mi
           sidecar:
             # The dashboard comes from this file, so no sidecar watches for
             # dashboard ConfigMaps. The datasource sidecar stays: it loads the
