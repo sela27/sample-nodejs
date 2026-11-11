@@ -526,6 +526,8 @@ unset SONAR_TOKEN
 
 **Setup.** The GitHub account was imported into SonarQube Cloud as an organization on the free plan, with the SonarQubeCloud GitHub app allowed on this repo only. The project's analysis method is GitHub Actions, with Automatic Analysis off. With both on, every CI analysis fails.
 
+**The app's own check.** The SonarQubeCloud app also posts a check on each PR, `SonarCloud Code Analysis`. It is SonarQube's default quality gate, "Sonar way", applied to the PR's new code: reliability, security and maintainability ratings, 80% coverage, at most 3% duplication, and all security hotspots reviewed. It is not a required check, because `sast` is the Gate. It is still worth reading: on this Gate's own PR it caught two reliability issues in `scripts/sast-gate.js`, a regular expression open to backtracking and an unhandled promise, which were fixed before the merge.
+
 `test/sast-gate.test.js` drives the script against a fake Web API in the `test` check:
 
 - A blocking finding, on the PR or on `main`, fails it.
