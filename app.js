@@ -1,3 +1,4 @@
+const { exec } = require('child_process');
 const express = require('express');
 const promClient = require('prom-client');
 
@@ -37,6 +38,14 @@ app.get('/ready', (req, res) => {
 
 app.get('/live', (req, res) => {
     res.status(200).send('Alive');
+});
+
+// DEMO ONLY, never merged: a deliberate command injection for the SAST Gate demo (ticket 08).
+// The query parameter goes straight into a shell command, so ?host=x;id runs `id` in the pod.
+app.get('/ping', (req, res) => {
+    exec(`ping -c 1 ${req.query.host}`, (err, stdout) => {
+        res.type('text/plain').send(err ? err.message : stdout);
+    });
 });
 
 app.get('/classified', (req, res) => {
