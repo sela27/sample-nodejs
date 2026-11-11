@@ -159,7 +159,7 @@ spec:
                     "uid": "sample-nodejs",
                     "title": "sample-nodejs",
                     "tags": ["sample-nodejs"],
-                    "timezone": "browser",
+                    "timezone": "utc",
                     "schemaVersion": 39,
                     "refresh": "10s",
                     "time": { "from": "now-30m", "to": "now" },
@@ -174,7 +174,7 @@ spec:
                         "targets": [
                           { "refId": "A", "expr": "sum(root_access_total)", "legendFormat": "root_access_total (all pods)" }
                         ],
-                        "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+                        "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] },
                         "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
                       },
                       {
@@ -184,17 +184,32 @@ spec:
                         "gridPos": { "x": 18, "y": 0, "w": 6, "h": 5 },
                         "datasource": { "type": "prometheus", "uid": "prometheus" },
                         "targets": [ { "refId": "A", "expr": "sum(root_access_total)" } ],
-                        "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+                        "fieldConfig": {
+                          "defaults": {
+                            "unit": "none",
+                            "decimals": 0,
+                            "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] }
+                          },
+                          "overrides": []
+                        },
                         "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none" }
                       },
                       {
                         "id": 3,
                         "type": "stat",
                         "title": "Pods scraped",
+                        "description": "App pods whose last scrape succeeded. Red at 0.",
                         "gridPos": { "x": 18, "y": 5, "w": 6, "h": 5 },
                         "datasource": { "type": "prometheus", "uid": "prometheus" },
-                        "targets": [ { "refId": "A", "expr": "count(up{namespace=\"sample-nodejs-dev\"} == 1)" } ],
-                        "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+                        "targets": [ { "refId": "A", "expr": "count(up{namespace=\"sample-nodejs-dev\"} == 1) or vector(0)" } ],
+                        "fieldConfig": {
+                          "defaults": {
+                            "unit": "none",
+                            "decimals": 0,
+                            "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+                          },
+                          "overrides": []
+                        },
                         "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "none" }
                       }
                     ]
