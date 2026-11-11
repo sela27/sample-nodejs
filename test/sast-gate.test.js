@@ -160,3 +160,10 @@ test('no token is an error before any request', async () => {
   assert.match(output, /SONAR_TOKEN is empty/);
   assert.equal(api.requests.length, 0);
 });
+
+test('trailing slashes on SONAR_HOST_URL are dropped', async () => {
+  const api = fakeApi({ tasks: [prTask], issues: { 7: [issue('P1', { severity: 'BLOCKER' })] } });
+  const { output } = await gate(['--pull-request', '7'], api, { SONAR_HOST_URL: 'https://sonar.test//' });
+  assert.match(output, /https:\/\/sonar\.test\/project\/issues\?id=acme_app/);
+  assert.ok(api.requests.every((r) => r.path.startsWith('/api/')));
+});

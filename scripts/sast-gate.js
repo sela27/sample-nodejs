@@ -110,7 +110,8 @@ async function run(argv, env, deps = {}) {
     out('::error::SONAR_TOKEN is empty. In Actions it comes from the repo secret; Dependabot PRs read the Dependabot secret of the same name, and PRs from forks get neither.');
     return 2;
   }
-  const host = (env.SONAR_HOST_URL || 'https://sonarcloud.io').replace(/\/+$/, '');
+  let host = env.SONAR_HOST_URL || 'https://sonarcloud.io';
+  while (host.endsWith('/')) host = host.slice(0, -1);
 
   // GET <host>/api/<path>. Retries a network error or a 5xx three times.
   async function api(path, params) {
@@ -243,5 +244,11 @@ async function run(argv, env, deps = {}) {
 module.exports = { parseProperties, isBlocking, severityLabel, run };
 
 if (require.main === module) {
-  run(process.argv.slice(2), process.env).then((code) => process.exit(code));
+  run(process.argv.slice(2), process.env).then(
+    (code) => process.exit(code),
+    (err) => {
+      console.log(`::error::SAST Gate crashed: ${err.stack || err}`);
+      process.exit(2);
+    },
+  );
 }
