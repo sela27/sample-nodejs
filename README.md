@@ -188,6 +188,7 @@ npm test
 - `test/bootstrap.test.js` runs `scripts/bootstrap.sh` without `GHCR_PULL_TOKEN`, with the cluster tools replaced by stubs, and checks that it stops at once with a message saying what to set, before any tool runs.
 - `test/smoke-test.test.js` runs `scripts/smoke-test.sh` over HTTPS with curl and kubectl replaced by stubs. It checks that the script verifies the certificate against the CA from the secret, and skips the check only with `--insecure`.
 - `test/sast-gate.test.js` drives `scripts/sast-gate.js` against a fake SonarQube Web API ([SAST Gate](#sast-gate)).
+- `test/request-loop.test.js` runs `scripts/request-loop.js` against a local server for one second each time. It checks the summary line and exit code for 200s, for other statuses, and for a response that breaks off or stalls past `--timeout`, and that the loop still exits then.
 
 The tests that run bash scripts need bash; on Windows, run `npm test` from Git Bash. supertest is a dev dependency only; the app does not need it at runtime.
 

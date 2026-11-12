@@ -45,28 +45,33 @@ function log(message) {
 function once() {
   stats.total += 1;
   inFlight += 1;
+  // Each request is counted exactly once, by whichever comes first: the end
+  // of its response, or an error. A response can break off after its headers,
+  // and then neither req nor res emits what the other would; req's 'close'
+  // comes last in every case, so it counts what nothing else did.
+  let counted = false;
+  function count(outcome, message) {
+    if (counted) return;
+    counted = true;
+    inFlight -= 1;
+    stats[outcome] += 1;
+    if (message) log(message);
+  }
   const headers = host ? { Host: host } : {};
   const req = http.request(
     { hostname: url.hostname, port: url.port || 80, path: url.pathname + url.search, headers, agent: false, timeout: timeoutMs },
     (res) => {
       res.resume();
       res.on('end', () => {
-        inFlight -= 1;
-        if (res.statusCode === 200) {
-          stats.ok += 1;
-        } else {
-          stats.non200 += 1;
-          log(`non-200: ${res.statusCode}`);
-        }
+        if (res.statusCode === 200) count('ok');
+        else count('non200', `non-200: ${res.statusCode}`);
       });
+      res.on('error', (err) => count('errors', `error: ${err.message}`));
     },
   );
   req.on('timeout', () => req.destroy(new Error('timeout')));
-  req.on('error', (err) => {
-    inFlight -= 1;
-    stats.errors += 1;
-    log(`error: ${err.message}`);
-  });
+  req.on('error', (err) => count('errors', `error: ${err.message}`));
+  req.on('close', () => count('errors', 'error: connection closed before the response ended'));
   req.end();
 }
 
