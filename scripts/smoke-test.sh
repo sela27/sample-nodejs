@@ -145,8 +145,10 @@ if [[ "$BASE_URL" == https://* ]]; then
     curl_options+=(--insecure)
   else
     ca_file="${CA_CERT:-}"
+    ca_source="CA_CERT (${ca_file})"
     if [[ -z "$ca_file" ]]; then
       ca_file="$tmp_dir/ca.pem"
+      ca_source="the CA in secret ${TLS_NAMESPACE}/${TLS_SECRET}"
       # A self-signed certificate is its own CA: cert-manager puts it in ca.crt
       # of the secret, and in tls.crt, which is the fallback.
       for key in 'ca\.crt' 'tls\.crt'; do
@@ -172,6 +174,7 @@ printf 'Smoke test of %s through %s\n\n' "$APP_HOST" "$BASE_URL"
 
 failures=0
 unanswered=0
+rejected_certificate=0
 
 # Prints an answer as `<status> "<body>"`, or as no response. The body is cut to
 # one short line, so a stray page cannot flood the terminal.
@@ -189,11 +192,12 @@ describe() {
 # expect <path> <status> [<body>]: one request to the path, with the Host header,
 # and a PASS or FAIL line for it.
 expect() {
-  local path="$1" want_status="$2" body_file="$tmp_dir/answer" status want got
-  local check_body=false
+  local path="$1" want_status="$2" body_file="$tmp_dir/answer" status want got curl_exit=0
+  local check_body=false bad_certificate=false
   [[ $# -ge 3 ]] && check_body=true
   status="$(curl --silent --max-time 10 --output "$body_file" --write-out '%{http_code}' \
-    "${curl_options[@]}" "${request_prefix}${path}" 2>/dev/null || true)"
+    "${curl_options[@]}" "${request_prefix}${path}" 2>/dev/null)" || curl_exit=$?
+  status="${status:-000}"
   [[ -f "$body_file" ]] || : >"$body_file"
 
   if [[ "$check_body" == true ]]; then
@@ -202,13 +206,24 @@ expect() {
     want="$want_status"
   fi
   got="$(describe "$status" "$body_file" "$check_body")"
+  # With no response, curl either reached nothing or rejected the certificate.
+  # It exits 60 when the certificate does not verify (51 before curl 7.62, for
+  # a name that does not match).
+  if [[ "$status" == "000" && ("$curl_exit" == 60 || "$curl_exit" == 51) ]]; then
+    bad_certificate=true
+    got="${got}: the certificate did not verify"
+  fi
 
   if [[ "$status" == "$want_status" ]] && { [[ "$check_body" == false ]] || [[ "$(cat "$body_file")" == "$3" ]]; }; then
     printf 'PASS  %-12s %s\n' "$path" "$got"
   else
     printf 'FAIL  %-12s expected %s, got %s\n' "$path" "$want" "$got"
     failures=$((failures + 1))
-    [[ "$status" == "000" ]] && unanswered=$((unanswered + 1))
+    if [[ "$bad_certificate" == true ]]; then
+      rejected_certificate=$((rejected_certificate + 1))
+    elif [[ "$status" == "000" ]]; then
+      unanswered=$((unanswered + 1))
+    fi
   fi
   rm -f "$body_file"
 }
@@ -223,6 +238,10 @@ expect /ready 404
 
 if ((failures > 0)); then
   printf '\n%d path(s) failed.\n' "$failures"
+  if ((rejected_certificate > 0)); then
+    printf 'The certificate for %s did not verify against %s. Check that the Certificate is Ready (kubectl -n %s get certificate), or re-run with --insecure to see the paths answer without the check.\n' \
+      "$APP_HOST" "$ca_source" "$TLS_NAMESPACE"
+  fi
   if ((unanswered > 0)) && [[ "$port_forward" == false ]]; then
     printf 'Nothing answered at %s. Start "minikube tunnel -p %s" in another terminal, or re-run with --port-forward.\n' "$BASE_URL" "$MINIKUBE_PROFILE"
   fi

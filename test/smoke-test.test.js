@@ -30,6 +30,9 @@ while [ $# -gt 0 ]; do
 done
 printf 'curl %s\\n' "$ORIG_ARGS" >> "$STUB_LOG"
 [ -n "$cacert" ] && printf 'cacert-content %s\\n' "$(tr '\\n' '|' < "$cacert")" >> "$STUB_LOG"
+# With STUB_CURL_EXIT set, every request fails the way real curl fails:
+# status 000, and that exit code (60: certificate rejected, 7: no connection).
+if [ -n "$STUB_CURL_EXIT" ]; then : > "$out"; printf 000; exit "$STUB_CURL_EXIT"; fi
 case "$url" in
   */my-app) printf 'Hello, World!' > "$out"; printf 200 ;;
   */about) : > "$out"; printf 200 ;;
@@ -139,4 +142,22 @@ test('--port-forward without --https forwards port 80', (t) => {
 
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.ok(result.calls.some((c) => /^kubectl .*port-forward service\/traefik :80$/.test(c)));
+});
+
+test('a certificate that does not verify is reported as such, not as a missing tunnel', (t) => {
+    const result = run(t, [], { BASE_URL: `https://${HOST}`, STUB_CURL_EXIT: '60' });
+
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stdout, /^FAIL {2}\/my-app .*got no response: the certificate did not verify$/m);
+    assert.match(result.stdout, /The certificate for sample-nodejs\.127\.0\.0\.1\.nip\.io did not verify against the CA in secret sample-nodejs-dev\/sample-nodejs-dev-tls\./);
+    assert.doesNotMatch(result.stdout, /Nothing answered|minikube tunnel/);
+});
+
+test('when nothing answers, it says so and points to the tunnel', (t) => {
+    const result = run(t, [], { BASE_URL: `https://${HOST}`, STUB_CURL_EXIT: '7' });
+
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stdout, /^FAIL {2}\/my-app .*got no response$/m);
+    assert.match(result.stdout, /Nothing answered at https:\/\/sample-nodejs\.127\.0\.0\.1\.nip\.io\. Start "minikube tunnel -p minikube"/);
+    assert.doesNotMatch(result.stdout, /certificate did not verify/);
 });
