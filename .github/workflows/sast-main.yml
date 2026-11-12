@@ -1,9 +1,9 @@
 # SAST on main: every push to main is analyzed by SonarQube Cloud, so the
 # dashboard shows the code as merged, and the PR Gate (the sast job in pr.yml)
-# compares each PR against it. Here the Gate only reports: it lists any open
-# vulnerability at the top severities in the job log and the run summary,
-# and never fails on findings. A failed or unprocessed analysis still fails
-# the run, because then the dashboard is out of date.
+# compares each PR against it. This run is not a Gate, it only reports: it
+# lists any open vulnerability at the top severities in the job log and the
+# run summary, and never fails on findings. A failed or unprocessed analysis
+# still fails the run, because then the dashboard is out of date.
 #
 # GitHub starts no workflow for a push whose head commit says [skip ci], so
 # Bump commits, which change only the dev image tag, are not analyzed.
