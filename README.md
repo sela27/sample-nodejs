@@ -2,20 +2,69 @@
 
 ## Overview
 
-A lightweight Node.js application. It features basic web endpoints, Prometheus metrics integration, and is designed for Kubernetes deployment and CI/CD pipeline demonstrations.
+This repo takes a small Express sample app and ships it to Kubernetes end to end, with the checks a production team would want on the way. Everything is in this one repo: the app, its image, its Helm chart, the GitOps manifests ArgoCD deploys from, the CI/CD workflows, and a Bootstrap script for a local minikube cluster.
 
-## Features
+- **The app** (`app.js`): Express 4 on Node 24, serving `/my-app`, `/about`, `/classified` (internal), `/ready`, `/live` and Prometheus metrics on `/metrics`, including the `root_access_total` counter. It can be imported without opening a port, so tests drive it through HTTP in-process, and it shuts down gracefully on SIGTERM.
+- **The image**: a two-stage build on `node:24-alpine`, pinned by digest, with npm removed and running as uid 1000.
+- **The Helm chart**: a Deployment with probes, resources, a ConfigMap that rolls the pods when it changes, a restricted security context, an HPA, a PodDisruptionBudget, a NetworkPolicy, a Service and an Ingress that routes only the Public paths. TLS and a ServiceMonitor sit behind flags.
+- **Seven Gates on every PR**: tests, Dockerfile lint, chart check, secret scan, image vulnerability scan, IaC misconfiguration scan and SAST. A red one makes the merge button unavailable.
+- **A Release on every `feat` or `fix` merge**: semantic-release picks the version. The image is built, scanned again and pushed to a private GHCR package, then signed and attested, and a GitHub Release with an SBOM is created. Last, a Bump commit points `dev` at the new image.
+- **GitOps with ArgoCD**: an app-of-apps reads `gitops/` from this repo and installs Traefik, cert-manager, the monitoring stack and the app. The pipeline never touches the cluster.
 
-- Express.js web server
-- Prometheus metrics integration
-- Readiness and liveness probe endpoints
-- Customizable port via environment variable
-- Graceful shutdown on SIGTERM and SIGINT
+```mermaid
+flowchart TB
+    dev([Developer]) -->|"PR, Conventional Commit title"| checks
 
-## Prerequisites
+    subgraph github["GitHub"]
+        checks["PR checks: test, dockerfile-lint, chart,<br/>secrets, image-gate, iac-gate, sast"]
+        main[("main")]
+        release["release.yml:<br/>version, image, release, bump"]
+        ghrel["GitHub Release<br/>with SBOM"]
+        checks -->|"all green, squash merge"| main
+        main --> release
+        release --> ghrel
+        release -->|"Bump commit, deploy key"| main
+    end
 
-- Node.js 24 (Active LTS)
-- Docker, to build and run the container image
+    sonar["SonarQube Cloud"] <-->|"analysis, Web API"| checks
+    release -->|"push, sign, attest"| ghcr[("GHCR, private")]
+
+    subgraph cluster["minikube, Calico CNI"]
+        argocd["ArgoCD<br/>root app-of-apps"]
+        traefik["Traefik"]
+        app["sample-nodejs-dev<br/>Deployment, HPA, PDB,<br/>NetworkPolicy, Ingress"]
+        certs["cert-manager"]
+        monitoring["Prometheus, Grafana"]
+        argocd -->|sync| traefik
+        argocd -->|sync| app
+        argocd -->|sync| certs
+        argocd -->|sync| monitoring
+        traefik -->|"/my-app, /about"| app
+        monitoring -->|"scrape /metrics"| app
+    end
+
+    main -.->|"ArgoCD pulls gitops/"| argocd
+    app -.->|"pull with ghcr-pull"| ghcr
+    browser([Browser]) -->|"minikube tunnel, nip.io host"| traefik
+```
+
+A change travels like this:
+1. The developer opens a PR whose title is a Conventional Commit.
+2. Every Gate runs, and a red one blocks the merge.
+3. A squash merge puts one commit on `main`, and its type decides whether a Release happens.
+4. If one does, the release run pushes a clean, signed image and commits the new tag to `dev`'s values file.
+5. ArgoCD sees that commit and Deploys it. ArgoCD, not the pipeline, reports whether the Deploy is healthy.
+
+Contents:
+- [Quick start](#quick-start)
+- [Pipeline](#pipeline)
+- [Design decisions](#design-decisions)
+- [Security controls](#security-controls)
+- [Evidence index](#evidence-index)
+- [What would change in production](#what-would-change-in-production)
+- [How this was built](#how-this-was-built)
+
+The terms in capitals (Release, Bump commit, Gate, Public path, Environment, Deploy, Bootstrap, Demo PR) are defined in [GLOSSARY.md](GLOSSARY.md).
 
 ## Quick start
 
@@ -65,7 +114,7 @@ With the tunnel up, open the app in the browser at [http://sample-nodejs.127.0.0
 
 The defaults fit Docker Desktop with about 6 GB of memory. minikube cannot resize an existing cluster, so a new CPU or memory value takes effect only after `minikube delete`. Traefik's version is pinned in `gitops/apps/traefik.yaml` (chart 42.3.1, Traefik v3.7.17).
 
-## Verifying a Deploy
+### Verifying a Deploy
 
 `scripts/smoke-test.sh` checks a Deploy from outside the cluster, the way a client reaches the app: through Traefik, with the Ingress host. It is the only end-to-end test. In one pass it covers the chart, Traefik, the Public path allowlist on the Ingress and the ArgoCD Deploy. Run it once ArgoCD shows `sample-nodejs-dev` Synced, for example after a [Bump commit](#bump-commit). It runs against the local cluster only, not in CI, because the pipeline never reaches the cluster.
 
@@ -122,7 +171,9 @@ ArgoCD shows `sample-nodejs-dev` Synced to `main` and Healthy, with every object
 | `TLS_NAMESPACE`, `TLS_SECRET` | `sample-nodejs-dev`, `sample-nodejs-dev-tls` | HTTPS only: the secret the CA is read from |
 | `MINIKUBE_PROFILE` | `minikube` | kubectl context for `--port-forward` and for reading the secret |
 
-## Running tests
+### Running tests
+
+The tests need Node.js 24 (Active LTS).
 
 ```bash
 npm ci
@@ -133,262 +184,19 @@ npm test
 
 - `test/app.test.js` sends requests with supertest to the exported Express app in-process. It checks the status and body of `/my-app`, `/about`, `/ready`, `/live` and `/classified`, a 404 for an unknown path, and the `/metrics` contract: Prometheus content type, `root_access_total` present, and its value going up by one after a request to `/my-app`.
 - `test/entrypoint.test.js` checks that loading `app.js` does not open a port, and that `node app.js` listens on `PORT` (default 8080) and prints `Server running on port <PORT>`. Its [graceful shutdown](#graceful-shutdown) tests start `node app.js` as a child process. They check that it exits 0 on SIGTERM and on SIGINT, that a request in flight when SIGTERM arrives still gets its answer while new connections are refused, and that `SHUTDOWN_TIMEOUT_MS` forces exit 1 when a request never finishes. Windows does not deliver POSIX signals to a child process, so these tests are skipped there. CI runs them on Linux.
-- `test/bump-dev-image-tag.test.js` runs `scripts/bump-dev-image-tag.sh` with bash against a copy of the dev values ([Bump commit](#bump-commit)). On Windows, run `npm test` from Git Bash.
-
-supertest is a dev dependency only; the app does not need it at runtime.
-
-## Graceful shutdown
-
-On SIGTERM, which Kubernetes and `docker stop` send, or SIGINT (Ctrl+C), `node app.js`:
-
-1. Stops accepting new connections.
-2. Lets requests already in flight finish. It answers them with `Connection: close`, so a keep-alive client such as the ingress controller's connection pool cannot hold the shutdown open.
-3. Exits 0 once the server has closed.
-
-If connections are still open after `SHUTDOWN_TIMEOUT_MS` milliseconds (default `10000`), the app logs that on stderr and exits 1. The kubelet sends SIGKILL when the pod's termination grace period runs out, so the timeout must stay shorter than that grace period minus any preStop pause. The chart sets the grace period to 30 seconds and pauses 5 seconds in a preStop hook, which leaves the app 25 seconds, 15 more than its default timeout. See [Zero-downtime rollouts](#zero-downtime-rollouts).
-
-Before this, the container ignored SIGTERM altogether. Node runs as PID 1 in the container, and the kernel does not apply a signal's default action to PID 1, so a process without a handler never ends on SIGTERM. `docker stop` waited out its timeout and then killed it. Timed with `docker stop -t 10` on the hardened container from [Container image](#container-image) (Docker Desktop 29.6.1, 2026-11-10):
-
-| Image | `docker stop` took | Exit code |
-| --- | --- | --- |
-| Before (no handler) | 10.66 s | 137 (SIGKILL) |
-| Now | 0.58 s | 0 |
-
-## Container image
-
-```bash
-docker build -t sample-nodejs .
-docker run --rm -p 8080:8080 sample-nodejs
-curl http://localhost:8080/my-app   # Hello, World!
-```
-
-To run it under the same constraints as the hardened pod in the cluster (read-only root filesystem, uid and gid 1000, no capabilities, no privilege escalation), add these flags. `/ready` and `/my-app` answer the same way:
-
-```bash
-docker run --rm -p 8080:8080 --read-only --user 1000:1000 \
-  --cap-drop ALL --security-opt no-new-privileges sample-nodejs
-```
-
-The `Dockerfile` has two stages on the same base image:
-
-- The **build stage** runs `npm ci --omit=dev --ignore-scripts`. It installs production dependencies only, exactly as `package-lock.json` pins them, and runs no install scripts.
-- The **runtime stage** copies in only `app.js`, `package.json` and the production `node_modules`. It deletes npm, npx, corepack and yarn, sets `NODE_ENV=production`, runs as the image's built-in `node` user and exposes port 8080. The user is given by number, `USER 1000:1000`, so a runtime can check that it is not root from the image alone, without reading the image's `/etc/passwd`. The app files stay owned by root, so the app process cannot rewrite its own code.
-
-The base image is pinned by its multi-arch digest, with the tag in a comment, so every build starts from the same bytes. Picking up base-image patches means bumping the digest, which [Dependabot](#dependabot) proposes every week.
-
-`.dockerignore` is an allowlist. Only `app.js`, `package.json` and `package-lock.json` enter the build context. Tests, git metadata, docs, the tracker directory, CI and agent tooling, a local `node_modules` and any stray `.env` never reach the builder. A new source file has to be added there and to the `COPY` line.
-
-### Why `node:24-alpine`
-
-Node 24 is the Active LTS line. Before choosing a base, we scanned the candidates with Trivy 0.58.1 on 2026-11-08 and counted CRITICAL and HIGH findings:
-
-| Base image | CRITICAL | HIGH |
-| --- | --- | --- |
-| `node:24-alpine` | 0 | 6 |
-| `node:22-alpine` | 0 | 10 |
-| `node:22-slim` (Debian) | 1 | 44 |
-| distroless `nodejs22-debian12` | 1 | 6 |
-| Chainguard `node:latest` | 0 | 0 |
-
-Every Alpine finding was in the npm that the image bundles (its copies of `undici` and `brace-expansion`), not in Alpine itself. The app never runs npm, so the runtime stage deletes it. Without npm, `node:24-alpine` scans as clean as Chainguard, while staying an official Docker image with versioned tags on the LTS line. Chainguard's free tier publishes only `latest`, which follows the newest Node release rather than the LTS line. Alpine uses musl instead of glibc, which is fine here because both dependencies are plain JavaScript with no native modules.
-
-A scan of the built image with the same Trivy version finds nothing in Alpine or in Node's tooling. The findings left were in the app's own locked dependencies, not in the base image. The [Image Gate](#image-gate) caught them and the lockfile update fixed them.
-
-The image is about 65 MB compressed. The `node` binary is most of that, and the app's dependencies add about 10 MB.
-
-## Helm chart
-
-The chart lives in `gitops/charts/sample-nodejs/`, inside the `gitops/` directory that ArgoCD reads from this repo ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)).
-
-```text
-gitops/charts/sample-nodejs/
-├── Chart.yaml
-├── values.yaml         # chart defaults: everything that is the same in every Environment
-├── values-dev.yaml     # the dev Environment: image and Ingress host
-└── templates/
-    ├── _helpers.tpl    # object name, labels, image reference, app configuration
-    ├── configmap.yaml
-    ├── deployment.yaml
-    ├── hpa.yaml
-    ├── pdb.yaml
-    ├── serviceaccount.yaml
-    ├── service.yaml
-    ├── ingress.yaml
-    ├── networkpolicy.yaml
-    └── servicemonitor.yaml  # only with serviceMonitor.enabled
-```
-
-What it renders:
-
-- **Deployment.** One container, listening on port `config.port` (8080), named `http`. Startup and liveness probes call `/live`, the readiness probe calls `/ready`. CPU and memory requests and limits come from `resources` in the values.
-- **ConfigMap.** `PORT` (8080) and `NODE_ENV` (`production`) come from `config` in the values, through a ConfigMap that the container loads with `envFrom`. [Variables set in the pod spec override the image's own `ENV`](https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/), so the ConfigMap's `NODE_ENV` wins over the one the Dockerfile sets. The container port is the same `config.port` value, and the probes and the Service reach the app through that port by name, so `PORT`, the container port and the probes cannot drift apart.
-- **Rollout on a config change.** A container reads its environment variables only when it starts, so a changed ConfigMap alone would leave the running pods on the old values. The pod template carries a `checksum/config` annotation, the SHA-256 of the ConfigMap's data. A config change changes the checksum, and with it the pod template, so the Deployment rolls the pods. A change that leaves the ConfigMap as it is keeps the checksum and causes no rollout of its own.
-- **Pod hardening.** The pods meet the [restricted Pod Security profile](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted): `runAsNonRoot`, uid and gid 1000 (the image's `node` user), the `RuntimeDefault` seccomp profile, `allowPrivilegeEscalation: false` and every capability dropped. The root filesystem is read-only as well. The app writes nothing to disk, so it gets no writable volume, not even `/tmp`. These settings are written in the Deployment template, not taken from values, so no Environment's values file can loosen them.
-- **HorizontalPodAutoscaler.** An `autoscaling/v2` HPA keeps the Deployment between 2 and 5 replicas, aiming at 70% average CPU use. All three numbers come from `autoscaling` in the values. Utilization is a share of the CPU request, so the 50m request makes the target 35m per pod. metrics-server, which Bootstrap enables, supplies the readings. While the HPA is on (`autoscaling.enabled`, the default), the Deployment leaves `replicas` out, so the HPA owns the count. If the Deployment set it, every ArgoCD sync would put the count from git back over the one the HPA chose. With the HPA off, `replicaCount` (2) sets the replicas.
-- **Rollout settings.** A `RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1`, a 5-second native `sleep` preStop hook, `terminationGracePeriodSeconds: 30` and `progressDeadlineSeconds: 180`. They are written in the Deployment template, not taken from values. See [Zero-downtime rollouts](#zero-downtime-rollouts).
-- **PodDisruptionBudget.** `minAvailable: 1` over the app's pods, from `podDisruptionBudget` in the values. A voluntary disruption, such as `kubectl drain`, can evict an app pod only while another one stays ready, so the app keeps serving through it. It does not cover a node or a pod crashing, only evictions. `minAvailable` stays below the fewest pods the Deployment runs (2), or no pod could ever be evicted and a drain would wait forever.
-- **ServiceAccount.** The pods run under their own ServiceAccount, with `automountServiceAccountToken: false` on both the ServiceAccount and the pod, because the app never calls the Kubernetes API. The ServiceAccount carries the registry pull secret for the private image as its `imagePullSecrets` entry. The chart only names the secret (`image.pullSecret`, default `ghcr-pull`); Bootstrap creates it in the app namespace ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)).
-- **Service.** `ClusterIP`, port 80 to the container's `http` port (8080). Nothing outside the cluster reaches it directly.
-- **Ingress.** `ingressClassName: traefik` and no controller-specific annotations ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)), so the controller can be replaced without a chart change. The host comes from the Environment's values. There is one `Prefix` rule per Public path, `/my-app` and `/about`, and nothing else. `/classified`, `/metrics`, `/ready` and `/live` have no route, so from outside the cluster they get the controller's 404.
-- **Ingress TLS, off by default (on in dev).** `ingress.tls.enabled: true` gives the Ingress a TLS section for the host, naming the secret `<object name>-tls` (`sample-nodejs-dev-tls` in dev), and one annotation, `cert-manager.io/cluster-issuer`, set from `ingress.tls.clusterIssuer`. cert-manager sees the annotation, has that ClusterIssuer sign a certificate for the host, and keeps it in the secret, where Traefik picks it up. The annotation is read by cert-manager, not by the Ingress controller, so the Ingress still has no controller-specific annotations. With the flag on and no issuer set, the chart refuses to render. See [HTTPS: Let's Encrypt in production, self-signed here](#https-lets-encrypt-in-production-self-signed-here).
-- **NetworkPolicy.** It selects the app's pods and admits traffic only on the container port (`http`, 8080), and only from Traefik's pods (`app.kubernetes.io/name: traefik`) in the `traefik` namespace, matched by the `kubernetes.io/metadata.name` label that Kubernetes sets on every namespace. Both selectors sit in one peer, so a pod must match both; as two peers they would admit any pod in the `traefik` namespace, or any pod with Traefik's labels in the app's namespace. Every other pod in the cluster, in any namespace including the app's own, cannot open a connection to the app, so `/classified` and `/metrics` stay out of its reach. The one exception is the ServiceMonitor flag, on in dev: it also admits the pods in the monitoring namespace, so Prometheus can scrape `/metrics`. The policy names the container port, not the Service's port 80, because it sees traffic after the Service has forwarded it to the pod. Egress is not restricted. The controller's namespace and pod labels come from `networkPolicy.ingressController` in the values. A NetworkPolicy is only enforced by a CNI plugin that implements it, which is why Bootstrap starts minikube with Calico. See [NetworkPolicy on the cluster](#networkpolicy-on-the-cluster).
-- **ServiceMonitor, off by default, on in dev.** `serviceMonitor.enabled: true` renders a `monitoring.coreos.com/v1` ServiceMonitor that scrapes `/metrics` on the Service's port `http`, every `serviceMonitor.interval` (30s), and adds the `monitoring` namespace (`networkPolicy.monitoring.namespace`) as a second peer of the NetworkPolicy, on the same container port. Off, the chart renders no ServiceMonitor and the NetworkPolicy admits only Traefik, so a cluster needs no monitoring CRDs. See [The ServiceMonitor flag](#the-servicemonitor-flag).
-- **Labels.** Every object and every pod carries `app.kubernetes.io/name`, `instance`, `version` (the image tag) and `managed-by`, plus Helm's `helm.sh/chart`. The Deployment selector uses only `name` and `instance`, which never change for a release, because a selector cannot be changed after creation.
-
-### Why a Deployment, not a StatefulSet
-
-The app keeps no data on disk, has no database, and needs no per-pod identity. Any pod can serve any request, and pods can be replaced in any order. The one piece of in-memory state, the `root_access_total` counter, is per pod by design: each pod reports its own count and Prometheus sums them, so losing a pod's count when the pod is replaced is expected, not data loss.
-
-A StatefulSet gives stable pod names, ordered start and stop, and a PersistentVolumeClaim per pod. The app uses none of these, and the ordered, one-at-a-time rollout would only make every Deploy slower. A StatefulSet is the right choice for a database, a message broker, or anything that needs a stable network identity or its own volume.
-
-### Zero-downtime rollouts
-
-A rollout must never lower the number of ready pods and never cut a request short. The Deployment says so in five settings:
-
-| Setting | Value | Why |
-| --- | --- | --- |
-| `strategy.rollingUpdate.maxUnavailable` | `0` | An old pod goes only after a new one is ready. |
-| `strategy.rollingUpdate.maxSurge` | `1` | One extra pod at a time. |
-| `lifecycle.preStop.sleep.seconds` | `5` | Kubernetes removes a terminating pod from the Service's endpoints and starts stopping it at the same moment, but Traefik hears of the removal a moment later. The pause keeps the app serving until Traefik has dropped it. The native `sleep` action (Kubernetes 1.30+) needs no shell in the image. |
-| `terminationGracePeriodSeconds` | `30` | The grace period starts before the preStop hook, so it must cover the 5 s pause plus the app's shutdown timeout (`SHUTDOWN_TIMEOUT_MS`, 10 s). 30 s leaves 15 s to spare. |
-| `progressDeadlineSeconds` | `180` | A rollout that makes no progress for 3 minutes, such as a new pod that never turns ready, is marked failed and ArgoCD shows the Deployment as Degraded, instead of after the default 10 minutes. An image pull plus the startup probe (30 s at most) fits well inside it. |
-
-The old pods keep serving during the whole rollout, so a stuck rollout leaves the old version running.
-
-**Checked on minikube** (2026-11-10), before merge, in a throwaway namespace, with the dev values (image tag `1.1.0`) under another Ingress host. `scripts/request-loop.js` sent 20 requests a second to `/my-app` through Traefik, each on a new connection, and counted every non-200 response and every connection error or timeout (5 s limit), while `kubectl rollout restart` ran four times in a row. The same test ran against the chart from `main` before this change:
-
-| Chart | Rollouts | Requests | Non-200 | Errors | Each rollout took |
-| --- | --- | --- | --- | --- | --- |
-| `main`, before | 4 | 2,925 | 7 (HTTP 502) | 67 (timeouts) | 6 s |
-| This branch | 4 | 2,922 | 0 | 0 | 6 s |
-
-With the default strategy (25% unavailable, 25% surge) and no preStop pause, every rollout produced a burst of 502s and timeouts, as Traefik kept sending requests to a pod that had stopped listening. With the new settings the loop saw no failure in 2,922 requests.
-
-To repeat it:
-
-```bash
-# 1. Install the chart in a throwaway namespace, under its own host.
-kubectl create namespace zdt-check
-helm install zdt gitops/charts/sample-nodejs -n zdt-check \
-  -f gitops/charts/sample-nodejs/values-dev.yaml --set ingress.host=zdt.example.test
-kubectl -n zdt-check rollout status deploy/zdt-sample-nodejs   # then wait until the HPA has made it two pods
-
-# 2. Reach Traefik from the workstation.
-kubectl -n traefik port-forward svc/traefik 18080:80 &
-
-# 3. Start the loop; it prints one summary line when its duration ends.
-node scripts/request-loop.js --url http://127.0.0.1:18080/my-app \
-  --host zdt.example.test --rps 20 --duration 180 &
-
-# 4. Roll the Deployment four times meanwhile.
-for i in 1 2 3 4; do
-  kubectl -n zdt-check rollout restart deploy/zdt-sample-nodejs
-  kubectl -n zdt-check rollout status deploy/zdt-sample-nodejs
-  sleep 5
-done
-wait   # prints: total=... ok=... non200=... errors=...
-
-# 5. Clean up.
-helm uninstall zdt -n zdt-check && kubectl delete namespace zdt-check
-```
-
-`scripts/request-loop.js` exits 1 if any request was not a 200 and logs each failure with a time stamp on stderr. The [Rollback](#rollback) demo reuses it.
-
-### Autoscaling under load
-
-Checked on minikube before merge, on a temporary copy of the dev Environment: an ArgoCD Application with the same chart and dev values, in a namespace of its own. At rest, metrics-server reads about 3m of CPU per pod, and the HPA holds the minimum of two:
-
-```text
-NAME                REFERENCE                      TARGETS       MINPODS   MAXPODS   REPLICAS
-sample-nodejs-t21   Deployment/sample-nodejs-t21   cpu: 6%/70%   2         5         2
-```
-
-A load pod (the app image running a short Node script, eight keep-alive connections to the Service's `/my-app` for three minutes) sent about 4,400 requests a second, 792,434 in all, with no errors. On the next reading the HPA saw 288% of the request and scaled out to four pods, then 15 seconds later to five, its maximum:
-
-```text
-SuccessfulRescale   New size: 4; reason: cpu resource utilization (percentage of request) above target
-SuccessfulRescale   New size: 5; reason: cpu resource utilization (percentage of request) above target
-
-NAME                REFERENCE                      TARGETS         MINPODS   MAXPODS   REPLICAS
-sample-nodejs-t21   Deployment/sample-nodejs-t21   cpu: 384%/70%   2         5         5
-```
-
-With five replicas running, a hard refresh left the Application `Synced`, the Deployment included, although its live `spec.replicas` was 5: git sets no count, so there is nothing for ArgoCD to put back. The Application's health stayed `Progressing` only because the Ingress has no address until `minikube tunnel` runs. The PodDisruptionBudget followed the count: `kubectl get pdb` showed 1 allowed disruption with two pods and 4 with five.
-
-After the load stopped, the HPA waited out its default five-minute scale-down window, so that a short lull does not remove pods, then went to four and a minute later back to two. The Application was still `Synced`.
-
-The two original pods kept the load (242m and 142m at the end) while the three new ones idled at 3m. The load pod went through the Service, and a keep-alive connection stays on the pod it was opened to, so new pods get only new connections. Through the Ingress this matters less: Traefik sends requests to the pods' endpoints itself and balances them per request. A load test that has to spread evenly over the Service needs short-lived connections or more clients.
-
-### Values and Environments
-
-- `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the HPA (`autoscaling`) and the PodDisruptionBudget (`podDisruptionBudget`), the name of the registry pull secret, the Ingress class, the list of Public paths, the Ingress TLS flag, off, the Ingress controller that the NetworkPolicy admits (namespace `traefik`, pods labeled `app.kubernetes.io/name: traefik`), and the ServiceMonitor flag, off, with its scrape interval, its labels and the monitoring namespace the NetworkPolicy admits when it is on. An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
-- `values-dev.yaml` holds what the dev Environment adds: the image repository `ghcr.io/sela27/sample-nodejs`, the image tag, and the host `sample-nodejs.127.0.0.1.nip.io`. nip.io resolves that name to 127.0.0.1, where `minikube tunnel` exposes Traefik, so no hosts-file edit is needed.
-- The chart refuses to render without an image repository, an image tag, a host and a pull secret name, or with Ingress TLS on and no ClusterIssuer, so a missing value fails at render time, not in the cluster.
-- The dev image tag is a Release version, `1.0.0` at first, seeded by hand. From then on the [Bump commit](#bump-commit) is the only writer of `image.tag` in `values-dev.yaml`, and it always writes a Release version. No manifest uses `latest`.
-- Adding an Environment means adding a `values-<environment>.yaml` and an ArgoCD Application for it, with no chart change.
-
-Chart changes are `chore(chart)` commits, so they never produce a Release. They reach the cluster through ArgoCD, which renders the chart straight from git. For the same reason the chart's own `version` is never published or bumped; the version that matters is the image tag.
-
-### HTTPS: Let's Encrypt in production, self-signed here
-
-In production the ClusterIssuer would be a Let's Encrypt ACME issuer. Let's Encrypt certificates are free, every browser trusts them, and cert-manager renews them before they expire. The chart would not change: the production values file would turn the flag on and name that issuer.
-
-Let's Encrypt only signs for a name once it has checked, from the internet, that the requester controls it: either it fetches a token over HTTP on port 80 of the host (HTTP-01), or it reads a TXT record in the domain's DNS (DNS-01). Neither works for this local setup. `sample-nodejs.127.0.0.1.nip.io` resolves to 127.0.0.1, the loopback address of whichever machine asks, so Let's Encrypt's servers would reach themselves, not this cluster. And the DNS zone belongs to nip.io, so we cannot add a TXT record to it.
-
-So the local setup uses a self-signed ClusterIssuer: cert-manager signs the certificate itself, with no outside party involved. The traffic is encrypted all the same, but no trusted CA vouches for the certificate, so the browser shows a warning.
-
-The flag is on in `values-dev.yaml`, with `clusterIssuer: selfsigned-issuer`. Bootstrap brings cert-manager and the issuer (two child Applications, see [Quick start](#quick-start)), so the Ingress's `cert-manager.io/cluster-issuer` annotation makes cert-manager create a Certificate for `sample-nodejs.127.0.0.1.nip.io` and store it in the secret `sample-nodejs-dev-tls`, which Traefik serves on its `websecure` entrypoint (port 443). The route is the same on both entrypoints, so HTTP on port 80 still works and nothing redirects it. The NetworkPolicy needs no change: Traefik terminates TLS and talks to the pod on 8080 as before.
-
-Verifying it against a running cluster:
-
-```bash
-kubectl -n sample-nodejs-dev get certificate        # READY is True
-scripts/smoke-test.sh --port-forward --https        # the certificate is verified against the secret's CA
-```
-
-**Checked on minikube** (2026-11-10), after the merge of the PR that added this. ArgoCD synced `cert-manager` and `cluster-issuer` from a hard refresh of `root`, with no manual step; the ClusterIssuer `selfsigned-issuer` and the Certificate `sample-nodejs-dev-tls` were Ready within seconds of the pods starting, and the secret's `ca.crt` is filled (the self-signed certificate itself). The smoke test passed with the CA verified, not `--insecure`, in all four ways to reach the app: `BASE_URL=https://sample-nodejs.127.0.0.1.nip.io` through `minikube tunnel`, plain HTTP through the tunnel, `--port-forward --https` and `--port-forward`. With a CA that did not sign the certificate (a throwaway one in `CA_CERT`), the HTTPS run got no response, so the check does reject a wrong certificate. `scripts/verify-bootstrap.sh` passed all its checks.
-
-| | Before | After cert-manager |
-| --- | --- | --- |
-| minikube container memory (`docker stats`) | about 2.6 GiB of 4 GiB | 2.89 GiB of 4 GiB |
-| cert-manager pods (`kubectl top`) | n/a | controller 27 Mi, cainjector 29 Mi, webhook 12 Mi |
-
-In the browser, `https://sample-nodejs.127.0.0.1.nip.io/my-app` serves the app with the expected warning, because no trusted CA signed the certificate. The certificate is cert-manager's: issued 2026-11-10 for the Ingress host, valid for 90 days, with no subject or issuer name of its own (the host is in the subject alternative names):
-
-![The app over HTTPS, with the certificate viewer open](docs/screenshots/31-app-over-https.png)
-
-### The ServiceMonitor flag
-
-The app serves Prometheus text on `/metrics`, including `root_access_total`. The Ingress does not route that path, so Prometheus has to reach the Service from inside the cluster, and the NetworkPolicy has to let it in. One flag does both, and `values-dev.yaml` turns it on for the kube-prometheus-stack Application ([Monitoring](#monitoring)):
-
-```yaml
-serviceMonitor:
-  enabled: true
-  labels:
-    release: kube-prometheus-stack   # the label that Prometheus's serviceMonitorSelector matches
-```
-
-`serviceMonitor.labels` is empty by default, and Prometheus ignores a ServiceMonitor its selector does not match: kube-prometheus-stack selects on its Helm release name by default, so the label's value is the name of that release. `serviceMonitor.interval` (default `30s`) sets the scrape interval, and `networkPolicy.monitoring.namespace` (default `monitoring`) is the namespace Prometheus runs in. The ServiceMonitor selects the Service by the chart's name and instance labels, in its own namespace, so it scrapes only this release.
-
-A ServiceMonitor cannot be applied before its CRD exists, and on a fresh Bootstrap ArgoCD syncs the app and kube-prometheus-stack at the same time. Two settings let the app converge anyway. The ServiceMonitor carries ArgoCD's `SkipDryRunOnMissingResource=true` sync option, so the missing kind does not fail the dry run of the whole sync: the rest of the app is applied, and only the ServiceMonitor fails. The app's Application retries a failed sync with backoff (15 times, 10 seconds apart at first, doubling up to 3 minutes, so for about half an hour), until kube-prometheus-stack has installed the CRD. After the last try, ArgoCD does not sync the same commit again by itself; if the install took longer than that, sync the app once by hand, or let the next commit do it. Another Environment turns the flag on the same way, once its cluster has a Prometheus Operator.
-
-The NetworkPolicy admits every pod in the monitoring namespace, matched by the `kubernetes.io/metadata.name` label, not only the Prometheus pod: the pod's labels depend on how Prometheus was installed. Nothing but monitoring should run in that namespace.
-
-### Chart check
-
-`scripts/check-chart.sh` is the `chart` check, and runs the same way locally and in CI:
-
-1. `helm lint --strict` with the dev values (TLS on), and again with Ingress TLS off and with TLS on and another issuer. Warnings fail too.
-2. `helm template` with the dev values, and again with Ingress TLS off and with TLS on and a test ClusterIssuer name. A render with TLS on and no issuer must fail.
-3. kubeconform in strict mode, over the four renders (dev, TLS off, TLS on with another issuer, ServiceMonitor on), against the schemas of Kubernetes 1.35.1, the version Bootstrap runs. Strict mode also rejects unknown fields, such as a misspelled `containerPorts`, and duplicate keys, which Kubernetes would otherwise drop without a word.
-4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik` and the dev host (and, with TLS off, no annotations and no TLS section); the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; one NetworkPolicy selects the app's pods, restricts ingress only, admits one TCP port, the container port, and its first peer is Traefik's pods in the namespace that `gitops/apps/traefik.yaml` deploys Traefik into; the Deployment rolls with `maxUnavailable: 0` and `maxSurge: 1`, pauses in a native `sleep` preStop hook, has a termination grace period longer than that pause plus the app's 10-second shutdown timeout, and a progress deadline of at most 300 seconds; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
-5. Assertions on TLS. The dev render has one TLS entry, for the dev host, naming the secret `sample-nodejs-dev-tls`, and its only annotation is `cert-manager.io/cluster-issuer: selfsigned-issuer`. The render with TLS on and another issuer has the same shape with the issuer the check passed in; and with the TLS section and the annotation taken out, it is the TLS-off render, object for object, so the flag changes nothing else.
-6. Assertions on the ServiceMonitor. The dev render has one ServiceMonitor, with the `release` label that kube-prometheus-stack's Prometheus selects (the release name in `gitops/apps/kube-prometheus-stack.yaml`) and the `SkipDryRunOnMissingResource=true` sync option, and its NetworkPolicy's second peer is the namespace that Application deploys into. A render with the flag off has no ServiceMonitor, and its NetworkPolicy admits only Traefik's pods. A render with a scrape interval, a label and a namespace that differ from the defaults and from dev shows the values in the objects: one `monitoring.coreos.com/v1` ServiceMonitor with one endpoint, path `/metrics`, on the Service's port name, with that interval and label, selecting the Service by its labels and pinning the release; the NetworkPolicy has two peers, Traefik's first and unchanged, then the monitoring namespace, on the one container port; and with the ServiceMonitor and that peer taken out, it is the render with the flag off, object for object. The default values give `30s` and the `monitoring` namespace.
-7. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes, the Service's target and the NetworkPolicy's port together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
-
-Each failure prints what was expected and what the chart rendered. If the dev values added `/classified` to the Public paths, for example, the check fails with `expected: /about /my-app | got: /about /classified /my-app`.
+- `test/bump-dev-image-tag.test.js` runs `scripts/bump-dev-image-tag.sh` with bash against a copy of the dev values ([Bump commit](#bump-commit)).
+- `test/bootstrap.test.js` runs `scripts/bootstrap.sh` without `GHCR_PULL_TOKEN`, with the cluster tools replaced by stubs, and checks that it stops at once with a message saying what to set, before any tool runs.
+- `test/smoke-test.test.js` runs `scripts/smoke-test.sh` over HTTPS with curl and kubectl replaced by stubs. It checks that the script verifies the certificate against the CA from the secret, and skips the check only with `--insecure`.
+- `test/sast-gate.test.js` drives `scripts/sast-gate.js` against a fake SonarQube Web API ([SAST Gate](#sast-gate)).
+
+The tests that run bash scripts need bash; on Windows, run `npm test` from Git Bash. supertest is a dev dependency only; the app does not need it at runtime.
 
 ## Pipeline
+
+Three workflows make up the pipeline:
+- `.github/workflows/pr.yml` runs the Gates on every pull request. The PR cannot merge until all of them pass ([Branch protection](#branch-protection)).
+- `.github/workflows/release.yml` runs on every push to `main`. It turns a `feat` or `fix` merge into a Release and Deploys it to `dev`: version, then build, scan, push, sign and SBOM, then the GitHub Release, then the Bump commit ([Release flow](#release-flow)).
+- `.github/workflows/sast-main.yml` analyzes every push to `main` in SonarQube Cloud, for the dashboard. It reports only and blocks nothing ([SAST Gate](#sast-gate)).
 
 Every pull request to `main` runs these checks, defined in `.github/workflows/pr.yml`:
 
@@ -553,77 +361,33 @@ GitHub reported the PR's merge state as `BLOCKED`, and every other required chec
 - Lower severities pass, and so do issues of another project or another type.
 - An analysis that failed, timed out or is not of the PR is an error, never a pass.
 
-### Supply chain and permissions
+### Branch protection
 
-- Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
-- The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
-- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate`, helm and Trivy in `iac-gate`, Trivy and cosign in the release `image` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
-- gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
-- Each workflow's default token permission is `contents: read` and nothing else. A job that needs more asks for it in its own `permissions:` block. Only the release workflow does, as listed in [Release flow](#release-flow).
-- `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps. The one exception is the release `bump` job, which keeps its deploy key configured for its own push. No other action runs in that job, and checkout's post step removes the key.
-- `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
-- A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
-
-**An SBOM on every Release.** Each GitHub Release carries `sample-nodejs-<version>.cdx.json`, a CycloneDX JSON SBOM (software bill of materials) of the image it released. It lists every package in the image, the Alpine packages and the app's npm dependencies, each with its version and package URL. The release run makes it like this:
-
-1. After the push, the `image` job reads the digest of `ghcr.io/sela27/sample-nodejs:<version>` back from GHCR with `docker buildx imagetools inspect`, so it is the digest the registry serves, not one taken from the runner's Docker engine.
-2. The same pinned Trivy 0.76.2 as the image Gate reads the image at that digest from GHCR (`--image-src remote`, not the local copy) and writes the SBOM (`--format cyclonedx`). The SBOM therefore describes exactly the image the cluster pulls. It names that digest in its metadata, in the `aquasecurity:trivy:RepoDigest` property, and the job fails if the SBOM has no components or names another image.
-3. The file goes to the `release` job as a workflow artifact, and `@semantic-release/github` uploads it to the GitHub Release, through the `assets` entry in `.releaserc.yaml`. The plugin only logs a warning when an asset file is missing, and still creates the Release, so the job then downloads the asset back from the Release and compares it byte for byte with the file it uploaded. A Release without its SBOM turns the run red.
-
-Trivy makes the SBOM rather than a second tool such as Syft because it is already in the job, pinned and checked against its SHA-256, so there is nothing new to pin or trust. The SBOM holds the inventory only, no vulnerabilities: a vulnerability list would be out of date within days. Instead, the SBOM lets anyone scan a released image again against today's vulnerability database without pulling it from the private package. To check the SBOM of a Release (`v1.0.0` predates the SBOM and has none):
+`main` is protected by a repository ruleset named `protect-main`, and the repo allows squash merges only. `scripts/protect-main.sh` applies both through `gh api`, so the protection is reproducible and reviewable as code. `scripts/verify-protection.sh` reads the live settings back from GitHub and prints PASS or FAIL for each rule. Both need `gh`; applying needs a repo admin.
 
 ```bash
-v=1.1.0
-gh release download "v$v" --repo sela27/sample-nodejs --pattern "sample-nodejs-$v.cdx.json"
-docker run --rm -v "$PWD:/sbom:ro" cyclonedx/cyclonedx-cli:0.33.1 \
-  validate --input-file "/sbom/sample-nodejs-$v.cdx.json" --input-format json --fail-on-errors
-jq -r '.metadata.component.properties[] | select(.name == "aquasecurity:trivy:RepoDigest").value' "sample-nodejs-$v.cdx.json"
-trivy sbom --severity HIGH,CRITICAL "sample-nodejs-$v.cdx.json"   # the image's vulnerabilities as of today
+scripts/protect-main.sh         # create or update the ruleset and the merge settings
+scripts/verify-protection.sh    # check what GitHub actually enforces
 ```
 
-The `v1.1.0` Release, with the SBOM among its assets:
+The ruleset applies to `refs/heads/main` and is active:
 
-![GitHub Release v1.1.0 with sample-nodejs-1.1.0.cdx.json attached](docs/screenshots/27-release-with-sbom.png)
+- **A pull request is required**, with zero approvals, because there is a single maintainer. The checks are the review. The ruleset itself also allows squash merges only.
+- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate`, `iac-gate` and `sast`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
+- **Force-push and deletion of `main` are blocked.**
+- **Only the Bump commit's deploy key can bypass it**, and nobody else, the repo admin included. The bypass list holds one entry, deploy keys in `always` mode, so the pipeline can push the [Bump commit](#bump-commit) without a PR ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)). GitHub's deploy key bypass names no single key: it covers every deploy key of the repo. So `bump-commit` must stay the repo's only deploy key, and `scripts/verify-protection.sh` fails if another one appears. `always` records each bypass in the rule insights, where `exempt` would skip the rules without a trace.
 
-### Dependabot
+The repo merge settings:
 
-`.github/dependabot.yml` has Dependabot look for version updates once a week, on Monday, wherever this repo pins a dependency. Its PRs are ordinary PRs to `main`: they run every required check and merge only when all of them pass, so an update that breaks a test, the chart or the image Gate cannot land.
+- **Squash merging only.** Merge commits and rebase merging are turned off, so each PR becomes exactly one commit on `main`.
+- **The squash commit message is the PR title** (GitHub's "Default to pull request title"), with an empty body. The PR title is a Conventional Commit, so it alone decides whether the merge produces a Release.
+- **The head branch is deleted after the merge.**
 
-| What it updates | Directory | PRs | Title prefix | Release on merge |
-| --- | --- | --- | --- | --- |
-| The app's production npm dependencies (`dependencies` in `package.json`, and the packages below them in `package-lock.json`) | `/` | minor and patch updates together in the `production` group; each major in its own PR, except Express, which stays on 4 | `fix(deps)` | patch |
-| The app's dev npm dependencies (`devDependencies`) | `/` | all together in the `development` group | `chore(deps)` | none |
-| The release tooling (`release/package.json` and `release/package-lock.json`) | `/release` | minor and patch updates together in the `release-tooling` group | `ci(deps)` | none |
-| The base image (`FROM node:24-alpine@sha256:…` in the `Dockerfile`) | `/` | one PR with the new digest, staying on Node 24 | `chore(deps)` | none |
-| The actions in `.github/workflows/*.yml` | `/` | all together in the `actions` group | `ci(deps)` | none |
+While a required check is pending or failing, the PR page shows "Merging is blocked" and `gh pr merge` refuses. Once all of them are green, merge with `gh pr merge --squash` or the "Squash and merge" button. `--merge` and `--rebase` are refused.
 
-- **The prefix decides the Release.** The squash commit on `main` is the PR title, and Dependabot starts its titles with the configured prefix and a colon, as in `fix(deps): bump the production group with 2 updates`, `fix(deps): bump express from 4.22.3 to 4.22.4 in the production group` or `ci(deps): bump the actions group with 2 updates`. A security update adds `[security]` after the prefix, as in `fix(deps): [security] bump …`, which the commit analyzer still reads by its type. Only the app's production dependencies, the code the image runs, use the releasing `fix`. No entry sets `include: scope`, which would append a second scope to the prefix, as in `fix(deps)(deps)`.
-- **One dependency type per group.** A grouped PR takes the production prefix as soon as one production dependency is in it, so a mixed group would release dev-only changes. The app's two groups are therefore split by dependency type.
-- **A base-image update does not release by itself.** It merges as `chore(deps)`, so the patched base reaches GHCR with the next `fix` or `feat`. To ship a base-image security fix at once, retitle the Dependabot PR to `fix(deps): …` before merging it.
-- **Version comments stay in step.** Dependabot moves an action's SHA and its trailing version comment together. GitHub's docs say "Dependabot updates the version documentation of GitHub Actions when the comment is on the same line" ([supported ecosystems](https://docs.github.com/en/code-security/dependabot/ecosystems-supported-by-dependabot/supported-ecosystems-and-repositories#github-actions)), which is how every action here is pinned.
-- **Majors held back.** Major updates of Express (the spec keeps Express 4), of the base image (Node 24 is the chosen LTS line, see [Why `node:24-alpine`](#why-node24-alpine)) and of the release tooling are ignored. The release tooling's majors are a manual step: the preset's majors follow the release notes writer that semantic-release bundles (see "Pinned release tooling" in [Release flow](#release-flow)), and no PR check runs the release tooling, so a broken update would first show as a red `version` job on `main`. These rules hold back version updates only. Dependabot drops `update-types` ignore rules when it looks for a security fix ([`ignore_condition.rb`](https://github.com/dependabot/dependabot-core/blob/main/common/lib/dependabot/config/ignore_condition.rb)).
-- **Security updates** are a repo setting, separate from the file. When an advisory affects a locked version, Dependabot opens a fix PR without waiting for the schedule, with the same prefixes as the matching entry above. They need Dependabot alerts, and both are turned on by a repo admin:
+To add a Gate, add its job to `.github/workflows/pr.yml` and append its job id to `REQUIRED_CHECKS` in `scripts/protect-main.sh` in the same PR. Then apply the script from the Gate's branch once its PR is open and before it merges, so the PR that adds the Gate is already held to it. `scripts/verify-protection.sh` fails while the required checks and the PR jobs in `pr.yml` differ, which also catches a renamed job.
 
-  ```bash
-  gh api -X PUT repos/sela27/sample-nodejs/vulnerability-alerts
-  gh api -X PUT repos/sela27/sample-nodejs/automated-security-fixes
-  ```
-
-- **Alerts with no update to take** are dismissed with their reason, not left open. Both alerts so far are in packages that the npm CLI bundles inside its own tarball. semantic-release installs the npm CLI through its `@semantic-release/npm` plugin, which `.releaserc.yaml` never loads, so no release run executes that code. npm `overrides` cannot replace a bundled package; only a newer npm can.
-  - Alert 1, [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) in glob 13.0.6. GitHub's own rule for low-impact alerts in development dependencies dismissed it on 2026-11-10.
-  - Alert 2, [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (medium, a denial of service through crafted glob patterns) in minimatch 10.2.5. Dismissed on 2026-11-11 as "vulnerable code not used". The fix is in minimatch 11.0.1, and even the latest npm, 12.2.2, still bundles minimatch 10.
-
-- **Secrets.** A workflow run that Dependabot triggers gets a read-only token and only the repo's Dependabot secrets, never its Actions secrets. Of the required checks only `sast` needs a secret, `SONAR_TOKEN`, so it is stored under both ([SAST Gate](#sast-gate)).
-- **Not covered.** Dependabot does not read the versions pinned with a SHA-256 in the workflows (helm, kubeconform, yq, gitleaks, Trivy, cosign), the Traefik and ArgoCD chart versions, or the tool versions in the README. Those are bumped by hand.
-
-`scripts/check-dependabot.sh` validates the file before it lands, because GitHub reads it only from `main` and a mistake would show up as update PRs that never arrive. It checks the file against the Dependabot configuration schema with check-jsonschema 0.39.0, then against the policy above: the four entries, the weekly schedule, the prefix of each entry, no `include: scope`, and one dependency type per group of the app's updates. It needs [uv](https://docs.astral.sh/uv/) on PATH and prints PASS or FAIL per check:
-
-```bash
-scripts/check-dependabot.sh                    # checks .github/dependabot.yml
-scripts/check-dependabot.sh path/to/other.yml  # or another file
-```
-
-## Release flow
+### Release flow
 
 A squash merge into `main` becomes one commit, and its message is the PR title, a Conventional Commit. That commit type alone decides whether the merge produces a Release. `.github/workflows/release.yml` runs on every push to `main` and never on a pull request.
 
@@ -703,7 +467,7 @@ GITHUB_TOKEN="$(gh auth token)" node release/next-version.mjs
 
 Run it only on `main`. On any other branch, semantic-release force-updates the local `main` from GitHub before it declines to release.
 
-## Image signature and provenance
+### Image signature and provenance
 
 From 1.1.0 on, every image the release run pushes is signed and carries a build provenance attestation. Both are keyless: no signing key exists, so there is none to leak, store as a secret or rotate. The `image` job does it right after the push:
 
@@ -740,7 +504,7 @@ Use any Release from 1.1.0 on, or `ghcr.io/sela27/sample-nodejs@sha256:<digest>`
 
 Nothing checks the signature at deploy time yet. Verifying it at admission, with Kyverno or the Sigstore policy controller, is a next step.
 
-## Bump commit
+### Bump commit
 
 After each Release, the `bump` job in `.github/workflows/release.yml` points the dev Environment at the new image. It changes one line, `image.tag` in `gitops/charts/sample-nodejs/values-dev.yaml`, commits it as `chore(release): deploy <version> to dev [skip ci]`, and pushes it straight to `main`. ArgoCD sees the new tag in git and deploys it. The pipeline never reaches the cluster.
 
@@ -767,7 +531,352 @@ scripts/verify-protection.sh
 
 `test/bump-dev-image-tag.test.js` runs the script against a copy of the dev values in the `test` check. It checks that the diff is exactly the tag line, that a malformed version fails and leaves the file unchanged, and that a file without the tag fails. Local branches need a `git pull` after each Release, because the Bump commit lands in the same history as code commits ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)).
 
-## Rollback
+### Supply chain and permissions
+
+- Every third-party action is pinned by full commit SHA, with the version in a trailing comment, for example `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`. A tag can be moved to other code, a commit SHA cannot. The tags of `aquasecurity/trivy-action` and `setup-trivy` were hijacked on 2026-03-19 (CVE-2026-33634), and only workflows pinned by SHA were safe from the swap. The SHAs come from the actions' release tags through `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`, with annotated tags dereferenced to their commit.
+- The hadolint action pins its own hadolint image by digest, so pinning the action also fixes the linter version.
+- Tools that do not come as actions (helm, kubeconform and yq in the `chart` job, gitleaks in the `secrets` job, Trivy in `image-gate`, helm and Trivy in `iac-gate`, Trivy and cosign in the release `image` job) are downloaded at a pinned version and checked against a pinned SHA-256 before they run. The runner's preinstalled helm and yq are not used.
+- gitleaks prints its findings redacted, so the job log of this public repo does not repeat a leaked value.
+- Each workflow's default token permission is `contents: read` and nothing else. A job that needs more asks for it in its own `permissions:` block. Only the release workflow does, as listed in [Release flow](#release-flow).
+- `actions/checkout` runs with `persist-credentials: false`, so the token is not left in the git config for later steps. The one exception is the release `bump` job, which keeps its deploy key configured for its own push. No other action runs in that job, and checkout's post step removes the key.
+- `npm ci --ignore-scripts` keeps dependency install scripts from running on the runner, the same as in the image build.
+- A new push to a PR cancels that PR's run still in progress. A release run is never cancelled.
+
+**An SBOM on every Release.** Each GitHub Release carries `sample-nodejs-<version>.cdx.json`, a CycloneDX JSON SBOM (software bill of materials) of the image it released. It lists every package in the image, the Alpine packages and the app's npm dependencies, each with its version and package URL. The release run makes it like this:
+
+1. After the push, the `image` job reads the digest of `ghcr.io/sela27/sample-nodejs:<version>` back from GHCR with `docker buildx imagetools inspect`, so it is the digest the registry serves, not one taken from the runner's Docker engine.
+2. The same pinned Trivy 0.76.2 as the image Gate reads the image at that digest from GHCR (`--image-src remote`, not the local copy) and writes the SBOM (`--format cyclonedx`). The SBOM therefore describes exactly the image the cluster pulls. It names that digest in its metadata, in the `aquasecurity:trivy:RepoDigest` property, and the job fails if the SBOM has no components or names another image.
+3. The file goes to the `release` job as a workflow artifact, and `@semantic-release/github` uploads it to the GitHub Release, through the `assets` entry in `.releaserc.yaml`. The plugin only logs a warning when an asset file is missing, and still creates the Release, so the job then downloads the asset back from the Release and compares it byte for byte with the file it uploaded. A Release without its SBOM turns the run red.
+
+Trivy makes the SBOM rather than a second tool such as Syft because it is already in the job, pinned and checked against its SHA-256, so there is nothing new to pin or trust. The SBOM holds the inventory only, no vulnerabilities: a vulnerability list would be out of date within days. Instead, the SBOM lets anyone scan a released image again against today's vulnerability database without pulling it from the private package. To check the SBOM of a Release (`v1.0.0` predates the SBOM and has none):
+
+```bash
+v=1.1.0
+gh release download "v$v" --repo sela27/sample-nodejs --pattern "sample-nodejs-$v.cdx.json"
+docker run --rm -v "$PWD:/sbom:ro" cyclonedx/cyclonedx-cli:0.33.1 \
+  validate --input-file "/sbom/sample-nodejs-$v.cdx.json" --input-format json --fail-on-errors
+jq -r '.metadata.component.properties[] | select(.name == "aquasecurity:trivy:RepoDigest").value' "sample-nodejs-$v.cdx.json"
+trivy sbom --severity HIGH,CRITICAL "sample-nodejs-$v.cdx.json"   # the image's vulnerabilities as of today
+```
+
+The `v1.1.0` Release, with the SBOM among its assets:
+
+![GitHub Release v1.1.0 with sample-nodejs-1.1.0.cdx.json attached](docs/screenshots/27-release-with-sbom.png)
+
+### Dependabot
+
+`.github/dependabot.yml` has Dependabot look for version updates once a week, on Monday, wherever this repo pins a dependency. Its PRs are ordinary PRs to `main`: they run every required check and merge only when all of them pass, so an update that breaks a test, the chart or the image Gate cannot land.
+
+| What it updates | Directory | PRs | Title prefix | Release on merge |
+| --- | --- | --- | --- | --- |
+| The app's production npm dependencies (`dependencies` in `package.json`, and the packages below them in `package-lock.json`) | `/` | minor and patch updates together in the `production` group; each major in its own PR, except Express, which stays on 4 | `fix(deps)` | patch |
+| The app's dev npm dependencies (`devDependencies`) | `/` | all together in the `development` group | `chore(deps)` | none |
+| The release tooling (`release/package.json` and `release/package-lock.json`) | `/release` | minor and patch updates together in the `release-tooling` group | `ci(deps)` | none |
+| The base image (`FROM node:24-alpine@sha256:…` in the `Dockerfile`) | `/` | one PR with the new digest, staying on Node 24 | `chore(deps)` | none |
+| The actions in `.github/workflows/*.yml` | `/` | all together in the `actions` group | `ci(deps)` | none |
+
+- **The prefix decides the Release.** The squash commit on `main` is the PR title, and Dependabot starts its titles with the configured prefix and a colon, as in `fix(deps): bump the production group with 2 updates`, `fix(deps): bump express from 4.22.3 to 4.22.4 in the production group` or `ci(deps): bump the actions group with 2 updates`. A security update adds `[security]` after the prefix, as in `fix(deps): [security] bump …`, which the commit analyzer still reads by its type. Only the app's production dependencies, the code the image runs, use the releasing `fix`. No entry sets `include: scope`, which would append a second scope to the prefix, as in `fix(deps)(deps)`.
+- **One dependency type per group.** A grouped PR takes the production prefix as soon as one production dependency is in it, so a mixed group would release dev-only changes. The app's two groups are therefore split by dependency type.
+- **A base-image update does not release by itself.** It merges as `chore(deps)`, so the patched base reaches GHCR with the next `fix` or `feat`. To ship a base-image security fix at once, retitle the Dependabot PR to `fix(deps): …` before merging it.
+- **Version comments stay in step.** Dependabot moves an action's SHA and its trailing version comment together. GitHub's docs say "Dependabot updates the version documentation of GitHub Actions when the comment is on the same line" ([supported ecosystems](https://docs.github.com/en/code-security/dependabot/ecosystems-supported-by-dependabot/supported-ecosystems-and-repositories#github-actions)), which is how every action here is pinned.
+- **Majors held back.** Major updates of Express (the spec keeps Express 4), of the base image (Node 24 is the chosen LTS line, see [Why `node:24-alpine`](#why-node24-alpine)) and of the release tooling are ignored. The release tooling's majors are a manual step: the preset's majors follow the release notes writer that semantic-release bundles (see "Pinned release tooling" in [Release flow](#release-flow)), and no PR check runs the release tooling, so a broken update would first show as a red `version` job on `main`. These rules hold back version updates only. Dependabot drops `update-types` ignore rules when it looks for a security fix ([`ignore_condition.rb`](https://github.com/dependabot/dependabot-core/blob/main/common/lib/dependabot/config/ignore_condition.rb)).
+- **Security updates** are a repo setting, separate from the file. When an advisory affects a locked version, Dependabot opens a fix PR without waiting for the schedule, with the same prefixes as the matching entry above. They need Dependabot alerts. Both are on for this repo (checked 2026-11-12). A repo admin turns them on with:
+
+  ```bash
+  gh api -X PUT repos/sela27/sample-nodejs/vulnerability-alerts
+  gh api -X PUT repos/sela27/sample-nodejs/automated-security-fixes
+  ```
+
+- **Alerts with no update to take** are dismissed with their reason, not left open. Both alerts so far are in packages that the npm CLI bundles inside its own tarball. semantic-release installs the npm CLI through its `@semantic-release/npm` plugin, which `.releaserc.yaml` never loads, so no release run executes that code. npm `overrides` cannot replace a bundled package; only a newer npm can.
+  - Alert 1, [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) in glob 13.0.6. GitHub's own rule for low-impact alerts in development dependencies dismissed it on 2026-11-10.
+  - Alert 2, [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (medium, a denial of service through crafted glob patterns) in minimatch 10.2.5. Dismissed on 2026-11-11 as "vulnerable code not used". The fix is in minimatch 11.0.1, and even the latest npm, 12.2.2, still bundles minimatch 10.
+
+- **Secrets.** A workflow run that Dependabot triggers gets a read-only token and only the repo's Dependabot secrets, never its Actions secrets. Of the required checks only `sast` needs a secret, `SONAR_TOKEN`, so it is stored under both ([SAST Gate](#sast-gate)).
+- **Not covered.** Dependabot does not read the versions pinned with a SHA-256 in the workflows (helm, kubeconform, yq, gitleaks, Trivy, cosign), the Traefik and ArgoCD chart versions, or the tool versions in the README. Those are bumped by hand.
+
+`scripts/check-dependabot.sh` validates the file before it lands, because GitHub reads it only from `main` and a mistake would show up as update PRs that never arrive. It checks the file against the Dependabot configuration schema with check-jsonschema 0.39.0, then against the policy above: the four entries, the weekly schedule, the prefix of each entry, no `include: scope`, and one dependency type per group of the app's updates. It needs [uv](https://docs.astral.sh/uv/) on PATH and prints PASS or FAIL per check:
+
+```bash
+scripts/check-dependabot.sh                    # checks .github/dependabot.yml
+scripts/check-dependabot.sh path/to/other.yml  # or another file
+```
+
+## Design decisions
+
+The assignment asks for a reason behind each choice below. Each row gives the short answer and links to the section or ADR with the full one.
+
+| Question | Choice | Why |
+| --- | --- | --- |
+| Deployment or StatefulSet? | Deployment | The app keeps no disk, no database and no per-pod identity. Its one counter is per pod by design, and Prometheus sums it across pods. [Why a Deployment, not a StatefulSet](#why-a-deployment-not-a-statefulset) |
+| Which git workflow? | GitHub Flow: a short-lived branch and one PR per change, squash-merged into a protected `main` | One commit per PR on `main`, and its message is the PR title. Every change goes through the same Gates. [Branch protection](#branch-protection) |
+| How is the version bumped? | semantic-release reads the Conventional Commit type of each squash commit: `feat` gives a minor, `fix` a patch, the other types nothing | No manual version step. The git tag is the version, and `docs:`, `chore:` and `ci:` merges ship no new image. [Release flow](#release-flow) |
+| Which CI/CD tool? | GitHub Actions | The code is on GitHub. Its OIDC token signs the image with no stored key, and its workflow token pushes to GHCR with no extra credentials. |
+| Which SAST tool, and how does it fail on critical findings? | SonarQube Cloud, with our own Gate script over its Web API | It is free for public repos, and its taint analysis follows user input into a sink. Its default quality gate only checks new code, so `scripts/sast-gate.js` fails on any open vulnerability at the top severities in the whole project. [SAST Gate](#sast-gate) |
+| How does an image scan block deployment? | Trivy, as a pinned and checksummed binary, on every PR and again on `main` before the push | Any HIGH or CRITICAL finding fails, including unfixed ones, and the push, the tag and the Bump commit all come after the scan. So a vulnerable image never reaches the registry or the cluster. [Image Gate](#image-gate) |
+| Which image builder? | BuildKit (`docker buildx`) on GitHub-hosted runners | The runner has a Docker engine, so Kaniko, which exists to build inside a cluster without one, would add nothing. [Release flow](#release-flow) |
+| Which private registry? | GHCR, private package, with the repo's Actions access set to `Write` | It sits next to the code, the workflow token pushes to it, and `Write` lets the pipeline add versions but not delete them. [Release flow](#release-flow) |
+| How does the pipeline deploy? | It commits the new image tag (the Bump commit), and ArgoCD pulls it | The pipeline holds no cluster credentials and needs no self-hosted runner, which a fork's PR could use to run code on the host. [Bump commit](#bump-commit) |
+| Separate GitOps repo, or manifests in the app repo? | In the app repo, under `gitops/`, which is the only directory ArgoCD watches | With one service, one Environment and one maintainer, a second repo adds a cross-repo token and buys little. We would split for several services or Environments, or for different deploy permissions. [ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md) |
+| Which ingress controller? | Traefik, from its Helm chart, through ArgoCD | minikube's addon installs ingress-nginx, which the Kubernetes project retired in March 2026. The Ingress has no controller-specific annotations, so the controller can change. [ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md) |
+| How do secrets reach the cluster? | Bootstrap creates the registry pull secret and Grafana's admin Secret from outside git | Sealed Secrets would tie them to a key that dies with every local cluster. External Secrets is the production path. [ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md) |
+| Which base image? | `node:24-alpine`, pinned by digest, with npm deleted | Every Alpine finding was in the bundled npm, which the app never runs. Without it the image scans as clean as Chainguard and stays on the LTS line. [Why `node:24-alpine`](#why-node24-alpine) |
+| How is a bad Deploy undone? | `git revert` of the Bump commit, through a PR | ArgoCD's self-heal would undo `kubectl rollout undo`. A revert keeps git the source of truth and records the undo. [Rollback](#rollback) |
+| Why Calico? | minikube starts with the Calico CNI | Calico enforces NetworkPolicy. Without such a CNI, the app's NetworkPolicy would be accepted and ignored. [NetworkPolicy on the cluster](#networkpolicy-on-the-cluster) |
+
+The sections below hold the details: the image, graceful shutdown, the Helm chart and its checks on the cluster, rollback and monitoring.
+
+### Container image
+
+```bash
+docker build -t sample-nodejs .
+docker run --rm -p 8080:8080 sample-nodejs
+curl http://localhost:8080/my-app   # Hello, World!
+```
+
+To run it under the same constraints as the hardened pod in the cluster (read-only root filesystem, uid and gid 1000, no capabilities, no privilege escalation), add these flags. `/ready` and `/my-app` answer the same way:
+
+```bash
+docker run --rm -p 8080:8080 --read-only --user 1000:1000 \
+  --cap-drop ALL --security-opt no-new-privileges sample-nodejs
+```
+
+The `Dockerfile` has two stages on the same base image:
+
+- The **build stage** runs `npm ci --omit=dev --ignore-scripts`. It installs production dependencies only, exactly as `package-lock.json` pins them, and runs no install scripts.
+- The **runtime stage** copies in only `app.js`, `package.json` and the production `node_modules`. It deletes npm, npx, corepack and yarn, sets `NODE_ENV=production`, runs as the image's built-in `node` user and exposes port 8080. The user is given by number, `USER 1000:1000`, so a runtime can check that it is not root from the image alone, without reading the image's `/etc/passwd`. The app files stay owned by root, so the app process cannot rewrite its own code.
+
+The base image is pinned by its multi-arch digest, with the tag in a comment, so every build starts from the same bytes. Picking up base-image patches means bumping the digest, which [Dependabot](#dependabot) proposes every week.
+
+`.dockerignore` is an allowlist. Only `app.js`, `package.json` and `package-lock.json` enter the build context. Tests, git metadata, docs, the tracker directory, CI and agent tooling, a local `node_modules` and any stray `.env` never reach the builder. A new source file has to be added there and to the `COPY` line.
+
+#### Why `node:24-alpine`
+
+Node 24 is the Active LTS line. Before choosing a base, we scanned the candidates with Trivy 0.58.1 on 2026-11-08 and counted CRITICAL and HIGH findings:
+
+| Base image | CRITICAL | HIGH |
+| --- | --- | --- |
+| `node:24-alpine` | 0 | 6 |
+| `node:22-alpine` | 0 | 10 |
+| `node:22-slim` (Debian) | 1 | 44 |
+| distroless `nodejs22-debian12` | 1 | 6 |
+| Chainguard `node:latest` | 0 | 0 |
+
+Every Alpine finding was in the npm that the image bundles (its copies of `undici` and `brace-expansion`), not in Alpine itself. The app never runs npm, so the runtime stage deletes it. Without npm, `node:24-alpine` scans as clean as Chainguard, while staying an official Docker image with versioned tags on the LTS line. Chainguard's free tier publishes only `latest`, which follows the newest Node release rather than the LTS line. Alpine uses musl instead of glibc, which is fine here because both dependencies are plain JavaScript with no native modules.
+
+A scan of the built image with the same Trivy version finds nothing in Alpine or in Node's tooling. The findings left were in the app's own locked dependencies, not in the base image. The [Image Gate](#image-gate) caught them and the lockfile update fixed them.
+
+The image is about 65 MB compressed. The `node` binary is most of that, and the app's dependencies add about 10 MB.
+
+### Graceful shutdown
+
+On SIGTERM, which Kubernetes and `docker stop` send, or SIGINT (Ctrl+C), `node app.js`:
+
+1. Stops accepting new connections.
+2. Lets requests already in flight finish. It answers them with `Connection: close`, so a keep-alive client such as the ingress controller's connection pool cannot hold the shutdown open.
+3. Exits 0 once the server has closed.
+
+If connections are still open after `SHUTDOWN_TIMEOUT_MS` milliseconds (default `10000`), the app logs that on stderr and exits 1. The kubelet sends SIGKILL when the pod's termination grace period runs out, so the timeout must stay shorter than that grace period minus any preStop pause. The chart sets the grace period to 30 seconds and pauses 5 seconds in a preStop hook, which leaves the app 25 seconds, 15 more than its default timeout. See [Zero-downtime rollouts](#zero-downtime-rollouts).
+
+Before this, the container ignored SIGTERM altogether. Node runs as PID 1 in the container, and the kernel does not apply a signal's default action to PID 1, so a process without a handler never ends on SIGTERM. `docker stop` waited out its timeout and then killed it. Timed with `docker stop -t 10` on the hardened container from [Container image](#container-image) (Docker Desktop 29.6.1, 2026-11-10):
+
+| Image | `docker stop` took | Exit code |
+| --- | --- | --- |
+| Before (no handler) | 10.66 s | 137 (SIGKILL) |
+| Now | 0.58 s | 0 |
+
+### Helm chart
+
+The chart lives in `gitops/charts/sample-nodejs/`, inside the `gitops/` directory that ArgoCD reads from this repo ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)).
+
+```text
+gitops/charts/sample-nodejs/
+├── Chart.yaml
+├── values.yaml         # chart defaults: everything that is the same in every Environment
+├── values-dev.yaml     # the dev Environment: image and Ingress host
+└── templates/
+    ├── _helpers.tpl    # object name, labels, image reference, app configuration
+    ├── configmap.yaml
+    ├── deployment.yaml
+    ├── hpa.yaml
+    ├── pdb.yaml
+    ├── serviceaccount.yaml
+    ├── service.yaml
+    ├── ingress.yaml
+    ├── networkpolicy.yaml
+    └── servicemonitor.yaml  # only with serviceMonitor.enabled
+```
+
+What it renders:
+
+- **Deployment.** One container, listening on port `config.port` (8080), named `http`. Startup and liveness probes call `/live`, the readiness probe calls `/ready`. CPU and memory requests and limits come from `resources` in the values.
+- **ConfigMap.** `PORT` (8080) and `NODE_ENV` (`production`) come from `config` in the values, through a ConfigMap that the container loads with `envFrom`. [Variables set in the pod spec override the image's own `ENV`](https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/), so the ConfigMap's `NODE_ENV` wins over the one the Dockerfile sets. The container port is the same `config.port` value, and the probes and the Service reach the app through that port by name, so `PORT`, the container port and the probes cannot drift apart.
+- **Rollout on a config change.** A container reads its environment variables only when it starts, so a changed ConfigMap alone would leave the running pods on the old values. The pod template carries a `checksum/config` annotation, the SHA-256 of the ConfigMap's data. A config change changes the checksum, and with it the pod template, so the Deployment rolls the pods. A change that leaves the ConfigMap as it is keeps the checksum and causes no rollout of its own.
+- **Pod hardening.** The pods meet the [restricted Pod Security profile](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted): `runAsNonRoot`, uid and gid 1000 (the image's `node` user), the `RuntimeDefault` seccomp profile, `allowPrivilegeEscalation: false` and every capability dropped. The root filesystem is read-only as well. The app writes nothing to disk, so it gets no writable volume, not even `/tmp`. These settings are written in the Deployment template, not taken from values, so no Environment's values file can loosen them.
+- **HorizontalPodAutoscaler.** An `autoscaling/v2` HPA keeps the Deployment between 2 and 5 replicas, aiming at 70% average CPU use. All three numbers come from `autoscaling` in the values. Utilization is a share of the CPU request, so the 50m request makes the target 35m per pod. metrics-server, which Bootstrap enables, supplies the readings. While the HPA is on (`autoscaling.enabled`, the default), the Deployment leaves `replicas` out, so the HPA owns the count. If the Deployment set it, every ArgoCD sync would put the count from git back over the one the HPA chose. With the HPA off, `replicaCount` (2) sets the replicas.
+- **Rollout settings.** A `RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1`, a 5-second native `sleep` preStop hook, `terminationGracePeriodSeconds: 30` and `progressDeadlineSeconds: 180`. They are written in the Deployment template, not taken from values. See [Zero-downtime rollouts](#zero-downtime-rollouts).
+- **PodDisruptionBudget.** `minAvailable: 1` over the app's pods, from `podDisruptionBudget` in the values. A voluntary disruption, such as `kubectl drain`, can evict an app pod only while another one stays ready, so the app keeps serving through it. It does not cover a node or a pod crashing, only evictions. `minAvailable` stays below the fewest pods the Deployment runs (2), or no pod could ever be evicted and a drain would wait forever.
+- **ServiceAccount.** The pods run under their own ServiceAccount, with `automountServiceAccountToken: false` on both the ServiceAccount and the pod, because the app never calls the Kubernetes API. The ServiceAccount carries the registry pull secret for the private image as its `imagePullSecrets` entry. The chart only names the secret (`image.pullSecret`, default `ghcr-pull`); Bootstrap creates it in the app namespace ([ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md)).
+- **Service.** `ClusterIP`, port 80 to the container's `http` port (8080). Nothing outside the cluster reaches it directly.
+- **Ingress.** `ingressClassName: traefik` and no controller-specific annotations ([ADR-0002](docs/adr/0002-traefik-instead-of-minikube-ingress-addon.md)), so the controller can be replaced without a chart change. The host comes from the Environment's values. There is one `Prefix` rule per Public path, `/my-app` and `/about`, and nothing else. `/classified`, `/metrics`, `/ready` and `/live` have no route, so from outside the cluster they get the controller's 404.
+- **Ingress TLS, off by default (on in dev).** `ingress.tls.enabled: true` gives the Ingress a TLS section for the host, naming the secret `<object name>-tls` (`sample-nodejs-dev-tls` in dev), and one annotation, `cert-manager.io/cluster-issuer`, set from `ingress.tls.clusterIssuer`. cert-manager sees the annotation, has that ClusterIssuer sign a certificate for the host, and keeps it in the secret, where Traefik picks it up. The annotation is read by cert-manager, not by the Ingress controller, so the Ingress still has no controller-specific annotations. With the flag on and no issuer set, the chart refuses to render. See [HTTPS: Let's Encrypt in production, self-signed here](#https-lets-encrypt-in-production-self-signed-here).
+- **NetworkPolicy.** It selects the app's pods and admits traffic only on the container port (`http`, 8080), and only from Traefik's pods (`app.kubernetes.io/name: traefik`) in the `traefik` namespace, matched by the `kubernetes.io/metadata.name` label that Kubernetes sets on every namespace. Both selectors sit in one peer, so a pod must match both; as two peers they would admit any pod in the `traefik` namespace, or any pod with Traefik's labels in the app's namespace. Every other pod in the cluster, in any namespace including the app's own, cannot open a connection to the app, so `/classified` and `/metrics` stay out of its reach. The one exception is the ServiceMonitor flag, on in dev: it also admits the pods in the monitoring namespace, so Prometheus can scrape `/metrics`. The policy names the container port, not the Service's port 80, because it sees traffic after the Service has forwarded it to the pod. Egress is not restricted. The controller's namespace and pod labels come from `networkPolicy.ingressController` in the values. A NetworkPolicy is only enforced by a CNI plugin that implements it, which is why Bootstrap starts minikube with Calico. See [NetworkPolicy on the cluster](#networkpolicy-on-the-cluster).
+- **ServiceMonitor, off by default, on in dev.** `serviceMonitor.enabled: true` renders a `monitoring.coreos.com/v1` ServiceMonitor that scrapes `/metrics` on the Service's port `http`, every `serviceMonitor.interval` (30s), and adds the `monitoring` namespace (`networkPolicy.monitoring.namespace`) as a second peer of the NetworkPolicy, on the same container port. Off, the chart renders no ServiceMonitor and the NetworkPolicy admits only Traefik, so a cluster needs no monitoring CRDs. See [The ServiceMonitor flag](#the-servicemonitor-flag).
+- **Labels.** Every object and every pod carries `app.kubernetes.io/name`, `instance`, `version` (the image tag) and `managed-by`, plus Helm's `helm.sh/chart`. The Deployment selector uses only `name` and `instance`, which never change for a release, because a selector cannot be changed after creation.
+
+#### Why a Deployment, not a StatefulSet
+
+The app keeps no data on disk, has no database, and needs no per-pod identity. Any pod can serve any request, and pods can be replaced in any order. The one piece of in-memory state, the `root_access_total` counter, is per pod by design: each pod reports its own count and Prometheus sums them, so losing a pod's count when the pod is replaced is expected, not data loss.
+
+A StatefulSet gives stable pod names, ordered start and stop, and a PersistentVolumeClaim per pod. The app uses none of these, and the ordered, one-at-a-time rollout would only make every Deploy slower. A StatefulSet is the right choice for a database, a message broker, or anything that needs a stable network identity or its own volume.
+
+#### Zero-downtime rollouts
+
+A rollout must never lower the number of ready pods and never cut a request short. The Deployment says so in five settings:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `strategy.rollingUpdate.maxUnavailable` | `0` | An old pod goes only after a new one is ready. |
+| `strategy.rollingUpdate.maxSurge` | `1` | One extra pod at a time. |
+| `lifecycle.preStop.sleep.seconds` | `5` | Kubernetes removes a terminating pod from the Service's endpoints and starts stopping it at the same moment, but Traefik hears of the removal a moment later. The pause keeps the app serving until Traefik has dropped it. The native `sleep` action (Kubernetes 1.30+) needs no shell in the image. |
+| `terminationGracePeriodSeconds` | `30` | The grace period starts before the preStop hook, so it must cover the 5 s pause plus the app's shutdown timeout (`SHUTDOWN_TIMEOUT_MS`, 10 s). 30 s leaves 15 s to spare. |
+| `progressDeadlineSeconds` | `180` | A rollout that makes no progress for 3 minutes, such as a new pod that never turns ready, is marked failed and ArgoCD shows the Deployment as Degraded, instead of after the default 10 minutes. An image pull plus the startup probe (30 s at most) fits well inside it. |
+
+The old pods keep serving during the whole rollout, so a stuck rollout leaves the old version running.
+
+**Checked on minikube** (2026-11-10), before merge, in a throwaway namespace, with the dev values (image tag `1.1.0`) under another Ingress host. `scripts/request-loop.js` sent 20 requests a second to `/my-app` through Traefik, each on a new connection, and counted every non-200 response and every connection error or timeout (5 s limit), while `kubectl rollout restart` ran four times in a row. The same test ran against the chart from `main` before this change:
+
+| Chart | Rollouts | Requests | Non-200 | Errors | Each rollout took |
+| --- | --- | --- | --- | --- | --- |
+| `main`, before | 4 | 2,925 | 7 (HTTP 502) | 67 (timeouts) | 6 s |
+| This branch | 4 | 2,922 | 0 | 0 | 6 s |
+
+With the default strategy (25% unavailable, 25% surge) and no preStop pause, every rollout produced a burst of 502s and timeouts, as Traefik kept sending requests to a pod that had stopped listening. With the new settings the loop saw no failure in 2,922 requests.
+
+To repeat it:
+
+```bash
+# 1. Install the chart in a throwaway namespace, under its own host.
+kubectl create namespace zdt-check
+helm install zdt gitops/charts/sample-nodejs -n zdt-check \
+  -f gitops/charts/sample-nodejs/values-dev.yaml --set ingress.host=zdt.example.test
+kubectl -n zdt-check rollout status deploy/zdt-sample-nodejs   # then wait until the HPA has made it two pods
+
+# 2. Reach Traefik from the workstation.
+kubectl -n traefik port-forward svc/traefik 18080:80 &
+
+# 3. Start the loop; it prints one summary line when its duration ends.
+node scripts/request-loop.js --url http://127.0.0.1:18080/my-app \
+  --host zdt.example.test --rps 20 --duration 180 &
+
+# 4. Roll the Deployment four times meanwhile.
+for i in 1 2 3 4; do
+  kubectl -n zdt-check rollout restart deploy/zdt-sample-nodejs
+  kubectl -n zdt-check rollout status deploy/zdt-sample-nodejs
+  sleep 5
+done
+wait   # prints: total=... ok=... non200=... errors=...
+
+# 5. Clean up.
+helm uninstall zdt -n zdt-check && kubectl delete namespace zdt-check
+```
+
+`scripts/request-loop.js` exits 1 if any request was not a 200 and logs each failure with a time stamp on stderr. The [Rollback](#rollback) demo reuses it.
+
+#### Autoscaling under load
+
+Checked on minikube before merge, on a temporary copy of the dev Environment: an ArgoCD Application with the same chart and dev values, in a namespace of its own. At rest, metrics-server reads about 3m of CPU per pod, and the HPA holds the minimum of two:
+
+```text
+NAME                REFERENCE                      TARGETS       MINPODS   MAXPODS   REPLICAS
+sample-nodejs-t21   Deployment/sample-nodejs-t21   cpu: 6%/70%   2         5         2
+```
+
+A load pod (the app image running a short Node script, eight keep-alive connections to the Service's `/my-app` for three minutes) sent about 4,400 requests a second, 792,434 in all, with no errors. On the next reading the HPA saw 288% of the request and scaled out to four pods, then 15 seconds later to five, its maximum:
+
+```text
+SuccessfulRescale   New size: 4; reason: cpu resource utilization (percentage of request) above target
+SuccessfulRescale   New size: 5; reason: cpu resource utilization (percentage of request) above target
+
+NAME                REFERENCE                      TARGETS         MINPODS   MAXPODS   REPLICAS
+sample-nodejs-t21   Deployment/sample-nodejs-t21   cpu: 384%/70%   2         5         5
+```
+
+With five replicas running, a hard refresh left the Application `Synced`, the Deployment included, although its live `spec.replicas` was 5: git sets no count, so there is nothing for ArgoCD to put back. The Application's health stayed `Progressing` only because the Ingress has no address until `minikube tunnel` runs. The PodDisruptionBudget followed the count: `kubectl get pdb` showed 1 allowed disruption with two pods and 4 with five.
+
+After the load stopped, the HPA waited out its default five-minute scale-down window, so that a short lull does not remove pods, then went to four and a minute later back to two. The Application was still `Synced`.
+
+The two original pods kept the load (242m and 142m at the end) while the three new ones idled at 3m. The load pod went through the Service, and a keep-alive connection stays on the pod it was opened to, so new pods get only new connections. Through the Ingress this matters less: Traefik sends requests to the pods' endpoints itself and balances them per request. A load test that has to spread evenly over the Service needs short-lived connections or more clients.
+
+#### Values and Environments
+
+- `values.yaml` holds everything that does not depend on the Environment: the app configuration (`config.port` and `config.nodeEnv`), the resources, the HPA (`autoscaling`) and the PodDisruptionBudget (`podDisruptionBudget`), the name of the registry pull secret, the Ingress class, the list of Public paths, the Ingress TLS flag, off, the Ingress controller that the NetworkPolicy admits (namespace `traefik`, pods labeled `app.kubernetes.io/name: traefik`), and the ServiceMonitor flag, off, with its scrape interval, its labels and the monitoring namespace the NetworkPolicy admits when it is on. An Environment that turns the flag on also sets its ClusterIssuer, because the issuer depends on the cluster.
+- `values-dev.yaml` holds what the dev Environment adds: the image repository `ghcr.io/sela27/sample-nodejs`, the image tag, and the host `sample-nodejs.127.0.0.1.nip.io`. nip.io resolves that name to 127.0.0.1, where `minikube tunnel` exposes Traefik, so no hosts-file edit is needed.
+- The chart refuses to render without an image repository, an image tag, a host and a pull secret name, or with Ingress TLS on and no ClusterIssuer, so a missing value fails at render time, not in the cluster.
+- The dev image tag is a Release version, `1.0.0` at first, seeded by hand. From then on the [Bump commit](#bump-commit) is the only writer of `image.tag` in `values-dev.yaml`, and it always writes a Release version. No manifest uses `latest`.
+- Adding an Environment means adding a `values-<environment>.yaml` and an ArgoCD Application for it, with no chart change.
+
+Chart changes are `chore(chart)` commits, so they never produce a Release. They reach the cluster through ArgoCD, which renders the chart straight from git. For the same reason the chart's own `version` is never published or bumped; the version that matters is the image tag.
+
+#### HTTPS: Let's Encrypt in production, self-signed here
+
+In production the ClusterIssuer would be a Let's Encrypt ACME issuer. Let's Encrypt certificates are free, every browser trusts them, and cert-manager renews them before they expire. The chart would not change: the production values file would turn the flag on and name that issuer.
+
+Let's Encrypt only signs for a name once it has checked, from the internet, that the requester controls it: either it fetches a token over HTTP on port 80 of the host (HTTP-01), or it reads a TXT record in the domain's DNS (DNS-01). Neither works for this local setup. `sample-nodejs.127.0.0.1.nip.io` resolves to 127.0.0.1, the loopback address of whichever machine asks, so Let's Encrypt's servers would reach themselves, not this cluster. And the DNS zone belongs to nip.io, so we cannot add a TXT record to it.
+
+So the local setup uses a self-signed ClusterIssuer: cert-manager signs the certificate itself, with no outside party involved. The traffic is encrypted all the same, but no trusted CA vouches for the certificate, so the browser shows a warning.
+
+The flag is on in `values-dev.yaml`, with `clusterIssuer: selfsigned-issuer`. Bootstrap brings cert-manager and the issuer (two child Applications, see [Quick start](#quick-start)), so the Ingress's `cert-manager.io/cluster-issuer` annotation makes cert-manager create a Certificate for `sample-nodejs.127.0.0.1.nip.io` and store it in the secret `sample-nodejs-dev-tls`, which Traefik serves on its `websecure` entrypoint (port 443). The route is the same on both entrypoints, so HTTP on port 80 still works and nothing redirects it. The NetworkPolicy needs no change: Traefik terminates TLS and talks to the pod on 8080 as before.
+
+Verifying it against a running cluster:
+
+```bash
+kubectl -n sample-nodejs-dev get certificate        # READY is True
+scripts/smoke-test.sh --port-forward --https        # the certificate is verified against the secret's CA
+```
+
+**Checked on minikube** (2026-11-10), after the merge of the PR that added this. ArgoCD synced `cert-manager` and `cluster-issuer` from a hard refresh of `root`, with no manual step; the ClusterIssuer `selfsigned-issuer` and the Certificate `sample-nodejs-dev-tls` were Ready within seconds of the pods starting, and the secret's `ca.crt` is filled (the self-signed certificate itself). The smoke test passed with the CA verified, not `--insecure`, in all four ways to reach the app: `BASE_URL=https://sample-nodejs.127.0.0.1.nip.io` through `minikube tunnel`, plain HTTP through the tunnel, `--port-forward --https` and `--port-forward`. With a CA that did not sign the certificate (a throwaway one in `CA_CERT`), the HTTPS run got no response, so the check does reject a wrong certificate. `scripts/verify-bootstrap.sh` passed all its checks.
+
+| | Before | After cert-manager |
+| --- | --- | --- |
+| minikube container memory (`docker stats`) | about 2.6 GiB of 4 GiB | 2.89 GiB of 4 GiB |
+| cert-manager pods (`kubectl top`) | n/a | controller 27 Mi, cainjector 29 Mi, webhook 12 Mi |
+
+In the browser, `https://sample-nodejs.127.0.0.1.nip.io/my-app` serves the app with the expected warning, because no trusted CA signed the certificate. The certificate is cert-manager's: issued 2026-11-10 for the Ingress host, valid for 90 days, with no subject or issuer name of its own (the host is in the subject alternative names):
+
+![The app over HTTPS, with the certificate viewer open](docs/screenshots/31-app-over-https.png)
+
+#### The ServiceMonitor flag
+
+The app serves Prometheus text on `/metrics`, including `root_access_total`. The Ingress does not route that path, so Prometheus has to reach the Service from inside the cluster, and the NetworkPolicy has to let it in. One flag does both, and `values-dev.yaml` turns it on for the kube-prometheus-stack Application ([Monitoring](#monitoring)):
+
+```yaml
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack   # the label that Prometheus's serviceMonitorSelector matches
+```
+
+`serviceMonitor.labels` is empty by default, and Prometheus ignores a ServiceMonitor its selector does not match: kube-prometheus-stack selects on its Helm release name by default, so the label's value is the name of that release. `serviceMonitor.interval` (default `30s`) sets the scrape interval, and `networkPolicy.monitoring.namespace` (default `monitoring`) is the namespace Prometheus runs in. The ServiceMonitor selects the Service by the chart's name and instance labels, in its own namespace, so it scrapes only this release.
+
+A ServiceMonitor cannot be applied before its CRD exists, and on a fresh Bootstrap ArgoCD syncs the app and kube-prometheus-stack at the same time. Two settings let the app converge anyway. The ServiceMonitor carries ArgoCD's `SkipDryRunOnMissingResource=true` sync option, so the missing kind does not fail the dry run of the whole sync: the rest of the app is applied, and only the ServiceMonitor fails. The app's Application retries a failed sync with backoff (15 times, 10 seconds apart at first, doubling up to 3 minutes, so for about half an hour), until kube-prometheus-stack has installed the CRD. After the last try, ArgoCD does not sync the same commit again by itself; if the install took longer than that, sync the app once by hand, or let the next commit do it. Another Environment turns the flag on the same way, once its cluster has a Prometheus Operator.
+
+The NetworkPolicy admits every pod in the monitoring namespace, matched by the `kubernetes.io/metadata.name` label, not only the Prometheus pod: the pod's labels depend on how Prometheus was installed. Nothing but monitoring should run in that namespace.
+
+#### Chart check
+
+`scripts/check-chart.sh` is the `chart` check, and runs the same way locally and in CI:
+
+1. `helm lint --strict` with the dev values (TLS on), and again with Ingress TLS off and with TLS on and another issuer. Warnings fail too.
+2. `helm template` with the dev values, and again with Ingress TLS off and with TLS on and a test ClusterIssuer name. A render with TLS on and no issuer must fail.
+3. kubeconform in strict mode, over the four renders (dev, TLS off, TLS on with another issuer, ServiceMonitor on), against the schemas of Kubernetes 1.35.1, the version Bootstrap runs. Strict mode also rejects unknown fields, such as a misspelled `containerPorts`, and duplicate keys, which Kubernetes would otherwise drop without a word.
+4. Assertions on the rendered manifests. The expected values come from the spec, not from the chart, so a chart edit cannot quietly move them: the Ingress serves exactly the Public paths, with class `traefik` and the dev host (and, with TLS off, no annotations and no TLS section); the probes call `/live` and `/ready` on the container port; the container listens on 8080; the Service is `ClusterIP`, maps 80 to 8080 and selects the app's pods; the Ingress points at that Service; the image is `ghcr.io/sela27/sample-nodejs` with a fixed tag, never `latest`; the pod hardening holds (non-root as uid and gid 1000, `RuntimeDefault` seccomp, read-only root filesystem, no privilege escalation, all capabilities dropped and none added); the pods run under the chart's ServiceAccount, mount no API token and get the `ghcr-pull` secret; an `autoscaling/v2` HPA scales that Deployment between 2 and 5 replicas on CPU alone at 70% utilization, every container it scales has a CPU request, and the Deployment sets no `replicas`; a PodDisruptionBudget with `minAvailable: 1` selects the app's pods and stays below the HPA's minimum, so a drain can still evict a pod; `PORT` (8080) and `NODE_ENV` (`production`) reach the app from the ConfigMap, and the pod template carries the `checksum/config` annotation; one NetworkPolicy selects the app's pods, restricts ingress only, admits one TCP port, the container port, and its first peer is Traefik's pods in the namespace that `gitops/apps/traefik.yaml` deploys Traefik into; the Deployment rolls with `maxUnavailable: 0` and `maxSurge: 1`, pauses in a native `sleep` preStop hook, has a termination grace period longer than that pause plus the app's 10-second shutdown timeout, and a progress deadline of at most 300 seconds; and every object and pod has the standard labels. A security setting may sit on the pod or on the container; the check reads the value the kubelet applies, the container's own if set, else the pod's. An environment variable is resolved the same way: an `env` entry wins over `envFrom`, a later `envFrom` source over an earlier one, and both over the image's `ENV`. So an `env` entry that shadows the ConfigMap fails the check, as does a reference to a ConfigMap the chart does not render.
+5. Assertions on TLS. The dev render has one TLS entry, for the dev host, naming the secret `sample-nodejs-dev-tls`, and its only annotation is `cert-manager.io/cluster-issuer: selfsigned-issuer`. The render with TLS on and another issuer has the same shape with the issuer the check passed in; and with the TLS section and the annotation taken out, it is the TLS-off render, object for object, so the flag changes nothing else.
+6. Assertions on the ServiceMonitor. The dev render has one ServiceMonitor, with the `release` label that kube-prometheus-stack's Prometheus selects (the release name in `gitops/apps/kube-prometheus-stack.yaml`) and the `SkipDryRunOnMissingResource=true` sync option, and its NetworkPolicy's second peer is the namespace that Application deploys into. A render with the flag off has no ServiceMonitor, and its NetworkPolicy admits only Traefik's pods. A render with a scrape interval, a label and a namespace that differ from the defaults and from dev shows the values in the objects: one `monitoring.coreos.com/v1` ServiceMonitor with one endpoint, path `/metrics`, on the Service's port name, with that interval and label, selecting the Service by its labels and pinning the release; the NetworkPolicy has two peers, Traefik's first and unchanged, then the monitoring namespace, on the one container port; and with the ServiceMonitor and that peer taken out, it is the render with the flag off, object for object. The default values give `30s` and the `monitoring` namespace.
+7. Renders with one value changed, to check what a values change does. Another `config.nodeEnv` reaches the app over the image's `NODE_ENV` and changes the checksum. Another `config.port` moves `PORT`, the container port, the probes, the Service's target and the NetworkPolicy's port together, and changes the checksum. A change outside the ConfigMap, such as `replicaCount` with the HPA off, keeps the checksum. Other `autoscaling` numbers reach the HPA. With the HPA off there is no HPA, the Deployment's `replicas` is `replicaCount`, and the default `replicaCount` still leaves the PodDisruptionBudget room to evict a pod.
+
+Each failure prints what was expected and what the chart rendered. If the dev values added `/classified` to the Public paths, for example, the check fails with `expected: /about /my-app | got: /about /classified /my-app`.
+
+### Rollback
 
 A Deploy is a commit, so rolling one back is a commit too: `git revert` the Bump commit that broke dev, open the revert as a PR, and merge it. ArgoCD sees the old tag in git and deploys it, the same way it deploys any Bump commit. Nobody runs `kubectl rollout undo`: ArgoCD's self-heal would put the broken tag straight back, because git still names it. `argocd app rollback` is refused while automated sync is on. The history keeps both the bad Deploy and its undo.
 
@@ -778,7 +887,7 @@ git push -u origin HEAD
 gh pr create --title "chore: revert the bad Deploy of <version>" --fill
 ```
 
-Title the PR `chore: …`. A revert of a `chore(release)` commit is not a code change, and a `chore` title keeps semantic-release from cutting a Release for it. The revert waits for the six required checks like any PR; on the demo's revert the slowest, `image-gate`, took 29 seconds. While it waits, dev keeps serving the old version, as the next part shows.
+Title the PR `chore: …`. A revert of a `chore(release)` commit is not a code change, and a `chore` title keeps semantic-release from cutting a Release for it. The revert waits for the required checks like any PR; on the demo's revert, before `sast` was added, the slowest, `image-gate`, took 29 seconds. While it waits, dev keeps serving the old version, as the next part shows.
 
 **What a bad Deploy does.** `maxUnavailable: 0` means an old pod goes only after a new pod is ready (see [Zero-downtime rollouts](#zero-downtime-rollouts)). A new pod that never turns ready therefore never replaces anything: the old pods keep serving and the rollout stalls. After `progressDeadlineSeconds` (3 minutes), the Deployment reports `ProgressDeadlineExceeded` and ArgoCD shows the Application as Degraded. That is the signal to revert.
 
@@ -807,7 +916,7 @@ total=7381 ok=7348 non200=0 errors=33
 
 Every response was a 200, including those during the Degraded window. The 33 errors are three bursts of exactly 11 timeouts each, at 19:08:33, 19:18:27 and 19:21:49. In each burst, about two seconds' worth of consecutive requests got no answer within the 5-second limit. The bursts do not line up with the rollout. The first came two minutes after Degraded, while nothing was changing. The other two came 7 and 10 minutes after the revert, while the Application sat Healthy. During all three, the cluster recorded no event, no pod or Traefik restart, and no HPA scaling. So the stall was on the workstation's side of the tunnel: either in `minikube tunnel` or in the `nip.io` name lookup that each new connection makes. The loop still exits 1 for these timeouts, and the numbers above are as it printed them.
 
-## Monitoring
+### Monitoring
 
 `gitops/apps/kube-prometheus-stack.yaml` installs kube-prometheus-stack into the `monitoring` namespace, from the prometheus-community chart pinned at 93.1.2 (Prometheus Operator v0.95.2, Grafana chart 14.4.1). The minikube node has 4 GiB and the cluster already used about 2.8 GiB, so the install is trimmed to three parts: the operator, one Prometheus and Grafana. Alertmanager, node-exporter, kube-state-metrics, the default rules and dashboards, and the scrapes of the control plane and the kubelet are all off. Prometheus scrapes one thing, the app, through its ServiceMonitor ([The ServiceMonitor flag](#the-servicemonitor-flag)), every 30 seconds. It keeps 6 hours of data in an emptyDir, so a new Prometheus pod starts empty. Each part has a memory limit.
 
@@ -872,32 +981,6 @@ Both tools count page cache that is in use, which the kernel can still reclaim, 
 
 The sidecar and the config-reloader had no limit in the first install: the chart sets none, and the 20:52 readings above are from then. Their limits went in after those readings.
 
-## Branch protection
-
-`main` is protected by a repository ruleset named `protect-main`, and the repo allows squash merges only. `scripts/protect-main.sh` applies both through `gh api`, so the protection is reproducible and reviewable as code. `scripts/verify-protection.sh` reads the live settings back from GitHub and prints PASS or FAIL for each rule. Both need `gh`; applying needs a repo admin.
-
-```bash
-scripts/protect-main.sh         # create or update the ruleset and the merge settings
-scripts/verify-protection.sh    # check what GitHub actually enforces
-```
-
-The ruleset applies to `refs/heads/main` and is active:
-
-- **A pull request is required**, with zero approvals, because there is a single maintainer. The checks are the review. The ruleset itself also allows squash merges only.
-- **The required status checks are the PR jobs**: `test`, `dockerfile-lint`, `chart`, `secrets`, `image-gate`, `iac-gate` and `sast`. Each one is bound to the GitHub Actions app, so only a workflow job can turn it green, not another app or a commit status posted with a personal token. A branch does not have to be up to date with `main` before it merges. The Bump commit lands on `main` after every Release, and requiring up-to-date branches would make every open PR re-run its checks each time.
-- **Force-push and deletion of `main` are blocked.**
-- **Only the Bump commit's deploy key can bypass it**, and nobody else, the repo admin included. The bypass list holds one entry, deploy keys in `always` mode, so the pipeline can push the [Bump commit](#bump-commit) without a PR ([ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md)). GitHub's deploy key bypass names no single key: it covers every deploy key of the repo. So `bump-commit` must stay the repo's only deploy key, and `scripts/verify-protection.sh` fails if another one appears. `always` records each bypass in the rule insights, where `exempt` would skip the rules without a trace.
-
-The repo merge settings:
-
-- **Squash merging only.** Merge commits and rebase merging are turned off, so each PR becomes exactly one commit on `main`.
-- **The squash commit message is the PR title** (GitHub's "Default to pull request title"), with an empty body. The PR title is a Conventional Commit, so it alone decides whether the merge produces a Release.
-- **The head branch is deleted after the merge.**
-
-While a required check is pending or failing, the PR page shows "Merging is blocked" and `gh pr merge` refuses. Once all of them are green, merge with `gh pr merge --squash` or the "Squash and merge" button. `--merge` and `--rebase` are refused.
-
-To add a Gate, add its job to `.github/workflows/pr.yml` and append its job id to `REQUIRED_CHECKS` in `scripts/protect-main.sh` in the same PR. Then apply the script from the Gate's branch once its PR is open and before it merges, so the PR that adds the Gate is already held to it. `scripts/verify-protection.sh` fails while the required checks and the PR jobs in `pr.yml` differ, which also catches a renamed job.
-
 ## Security controls
 
 Each security control in the delivery path, where it is enforced, and what it stops.
@@ -918,7 +1001,7 @@ Each security control in the delivery path, where it is enforced, and what it st
 | Image vulnerability scanning | The `image-gate` check on every PR (Trivy), required on `main` by the ruleset, and the same scan in the release run before the push | A PR whose image carries a known HIGH or CRITICAL vulnerability, in Alpine or in the app's dependencies, from merging into `main`, including one with no fixed version yet. On `main`, the same scan stops a vulnerable image from reaching GHCR, which also means no tag and no Release. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | IaC misconfiguration scanning | The `iac-gate` check on every PR (Trivy config, through `scripts/check-iac.sh`), required on `main` by the ruleset | A PR whose `Dockerfile` or rendered chart has a HIGH or CRITICAL misconfiguration from merging into `main`, such as a privileged container, one on the host's network or with a writable root filesystem, or an image that runs as root. It scans the chart as ArgoCD applies it to `dev`, rendered with the dev values, not the raw templates. The only ways past it are a fix, or a `.trivyignore` entry whose justification is reviewed in the PR. |
 | Static analysis (SAST) | The `sast` check on every PR (SonarQube Cloud, through `scripts/sast-gate.js`), required on `main` by the ruleset. Every push to `main` is analyzed for the dashboard ([SAST Gate](#sast-gate)) | A PR merging while the project has an open vulnerability at the top severities, such as a command or SQL injection built from user input, whether the PR adds it or it is already on `main`. Unlike SonarQube's default quality gate, it does not stop at new code. |
-| Dependency updates | Dependabot (`.github/dependabot.yml`): weekly version updates for the app's npm dependencies, the release tooling, the base image and the actions, plus security updates once they are turned on in the repo settings ([Dependabot](#dependabot)) | Pinned versions going stale. Every lockfile entry, the base-image digest and every action SHA is pinned on purpose, so without updates a known vulnerability would stay in place after its fix is published. Dependabot proposes each update as a PR, and the required checks still decide whether it merges. Only an update of the app's production dependencies produces a Release. |
+| Dependency updates | Dependabot (`.github/dependabot.yml`): weekly version updates for the app's npm dependencies, the release tooling, the base image and the actions, plus security updates, which are on ([Dependabot](#dependabot)) | Pinned versions going stale. Every lockfile entry, the base-image digest and every action SHA is pinned on purpose, so without updates a known vulnerability would stay in place after its fix is published. Dependabot proposes each update as a PR, and the required checks still decide whether it merges. Only an update of the app's production dependencies produces a Release. |
 | Signed image with build provenance | The release `image` job: a keyless cosign signature and an `actions/attest` SLSA provenance attestation on the pushed digest ([Image signature and provenance](#image-signature-and-provenance)) | An image that this repo's release workflow on `main` did not build passing as a Release: one pushed by hand, swapped behind a tag, or built by a fork or a PR run fails `cosign verify` and `gh attestation verify`. The cluster does not check it yet. |
 
 ### NetworkPolicy on the cluster
@@ -963,3 +1046,77 @@ $ for p in /my-app /about /classified /metrics; do
 ```
 
 The test Application and both namespaces were deleted afterwards. `dev` gets the NetworkPolicy when the change merges, through ArgoCD like any chart change.
+
+## Evidence index
+
+Each claim this README makes about a running system, and where to see it proven. The screenshots are in [`docs/screenshots/`](docs/screenshots). Times are UTC.
+
+| Claim | Evidence |
+| --- | --- |
+| The app is reachable through the Ingress | Screenshot [`19-my-app-in-browser.png`](docs/screenshots/19-my-app-in-browser.png), and `scripts/smoke-test.sh` passing all five paths ([Verifying a Deploy](#verifying-a-deploy)) |
+| Internal paths are not exposed | Screenshot [`20-classified-404-in-browser.png`](docs/screenshots/20-classified-404-in-browser.png): `/classified` gets Traefik's 404 ([Verifying a Deploy](#verifying-a-deploy)) |
+| ArgoCD Deploys the app from git, Synced and Healthy | Screenshot [`20-argocd-app-tree-synced-healthy.png`](docs/screenshots/20-argocd-app-tree-synced-healthy.png) ([Verifying a Deploy](#verifying-a-deploy)) |
+| The image Gate blocks a real vulnerability | PR [#10](https://github.com/sela27/sample-nodejs/pull/10) went red on the sample's own critical `proxy-addr` and two highs, with merging blocked. Screenshot [`06-image-gate-red-pr.png`](docs/screenshots/06-image-gate-red-pr.png) ([Image Gate](#image-gate)) |
+| The SAST Gate blocks a critical code finding | Demo PR [#39](https://github.com/sela27/sample-nodejs/pull/39), a command injection, closed without merging. Screenshots [`08-sast-red-merge-blocked.png`](docs/screenshots/08-sast-red-merge-blocked.png) and [`08-sonarqube-issue.png`](docs/screenshots/08-sonarqube-issue.png) ([SAST Gate](#sast-gate)) |
+| The secret scan catches a committed credential | PR [#9](https://github.com/sela27/sample-nodejs/pull/9) added a fake credential, and `secrets` went red. It was closed without merging |
+| The IaC Gate fails when the hardening goes | Its output with `readOnlyRootFilesystem` removed ([IaC Gate](#iac-gate)) |
+| SAST results beyond pass and fail | The [SonarQube Cloud dashboard](https://sonarcloud.io/project/overview?id=sela27_sample-nodejs) |
+| A green release run on `main`, every stage visible | [Run 42843956960](https://github.com/sela27/sample-nodejs/actions/runs/42843956960), which released `v1.1.0` from `feat(app): shut down gracefully on SIGTERM and SIGINT`: `version`, `image`, `release` and `bump`, all green, in under two minutes ([Release flow](#release-flow)) |
+| The image is in a private registry | Screenshot [`15-ghcr-package-private.png`](docs/screenshots/15-ghcr-package-private.png). Anonymous pulls get 401 and 403 ([Release flow](#release-flow)) |
+| Every Release carries an SBOM | Screenshot [`27-release-with-sbom.png`](docs/screenshots/27-release-with-sbom.png), and the [`v1.1.0` Release](https://github.com/sela27/sample-nodejs/releases/tag/v1.1.0) ([Supply chain and permissions](#supply-chain-and-permissions)) |
+| The image is signed, with build provenance | `cosign verify` and `gh attestation verify` against `1.1.0`, which anyone with a `read:packages` token can run ([Image signature and provenance](#image-signature-and-provenance)) |
+| `main` cannot be changed without a green PR | `scripts/verify-protection.sh` reads the live ruleset back. Screenshots 06 and 08 show merging blocked ([Branch protection](#branch-protection)) |
+| Rollouts drop no requests | 2,922 requests during four rollouts, 0 failed, against 74 failures with the default strategy ([Zero-downtime rollouts](#zero-downtime-rollouts)) |
+| A bad Deploy keeps the old version serving, and a revert undoes it | PRs [#35](https://github.com/sela27/sample-nodejs/pull/35) and [#36](https://github.com/sela27/sample-nodejs/pull/36), with the timeline. Screenshots [`24-argocd-degraded-bad-bump.png`](docs/screenshots/24-argocd-degraded-bad-bump.png) and [`24-argocd-healthy-after-revert.png`](docs/screenshots/24-argocd-healthy-after-revert.png) ([Rollback](#rollback)) |
+| The HPA scales under load | 2 to 5 replicas at 384% of the CPU request, and back to 2 ([Autoscaling under load](#autoscaling-under-load)) |
+| The NetworkPolicy is enforced | A pod in another namespace times out on `/classified`, while Traefik still serves the Public paths ([NetworkPolicy on the cluster](#networkpolicy-on-the-cluster)) |
+| The app stops cleanly on SIGTERM | `docker stop` in 0.58 s with exit 0, against 10.66 s and SIGKILL before ([Graceful shutdown](#graceful-shutdown)) |
+| HTTPS through cert-manager (stretch) | Screenshot [`31-app-over-https.png`](docs/screenshots/31-app-over-https.png), and the smoke test passing with the certificate verified ([HTTPS](#https-lets-encrypt-in-production-self-signed-here)) |
+| Grafana shows the counter rising (stretch) | Screenshot [`30-grafana-root-access-total.png`](docs/screenshots/30-grafana-root-access-total.png). 3517 requests raised `sum(root_access_total)` by exactly 3517 ([Monitoring](#monitoring)) |
+
+## What would change in production
+
+This setup is one local cluster with one Environment and one maintainer. In production, these would change, roughly in this order:
+
+**Cluster and Environments**
+- **A managed cluster built from code.** EKS, GKE or AKS, created with Terraform or OpenTofu, with several nodes across zones. Then anti-affinity and topology spread constraints would mean something, where on one node they mean nothing.
+- **More Environments and a promotion flow.** `staging` and `prod` would each get a values file and an Application, with no chart change ([Values and Environments](#values-and-environments)). The Bump commit would keep targeting `dev`. Promotion would be a PR that copies a tag already proven in `dev` into the next Environment's values file. `prod` would get required reviewers, and possibly a manual sync. An ApplicationSet would generate the Applications once there are several.
+- **A separate GitOps repo** once there are several services or Environments, or deploy rights that must differ from code rights. That is the point [ADR-0001](docs/adr/0001-gitops-manifests-in-app-repo.md) names.
+- **Gateway API** (`HTTPRoute`) in place of the Ingress, once the controller and the rest of the platform use it.
+
+**Secrets and identity**
+- **No token in the cluster for the registry.** The image would live in the cloud's own registry, and the nodes would pull it with their cloud identity, such as an EKS node role that can read ECR, with no pull secret at all. Pods that need a cloud API would get workload identity, such as IRSA, rather than keys. Other secrets would come from a cloud secret manager through the External Secrets Operator. That is the production path [ADR-0003](docs/adr/0003-registry-pull-secret-created-at-bootstrap.md) names, in place of Bootstrap creating Secrets by hand.
+- **SSO for ArgoCD and Grafana**, where today each has a local admin login.
+
+**Delivery and supply chain**
+- **Signatures checked at admission.** Kyverno or the Sigstore policy controller would admit only images whose cosign signature and provenance name this repo's release workflow on `main`. Today the signature is made but not checked.
+- **The smoke test in CI.** An ephemeral kind cluster would install the chart and run `scripts/smoke-test.sh` on every PR, so the Ingress, the NetworkPolicy and the chart would be tested before the merge, not only on the local cluster.
+- **DAST.** OWASP ZAP would scan the running app in `staging` before a promotion.
+- **Reviews.** With more than one maintainer, the ruleset would require an approval, and code owners for `gitops/` and `.github/`.
+- **ArgoCD Notifications** would send sync failures and Degraded Applications to chat. ArgoCD would also manage its own installation, instead of Bootstrap installing it with Helm.
+
+**Workload and network**
+- **Egress rules.** A default-deny NetworkPolicy in every namespace, with egress allowed only where it is needed. Today only ingress to the app is restricted.
+- **Let's Encrypt** for the Ingress certificate, through an ACME ClusterIssuer, with the same chart ([HTTPS](#https-lets-encrypt-in-production-self-signed-here)).
+- **Express 5.** The app stays on Express 4 here, to keep the sample's code as it is.
+
+**Monitoring**
+- **A full stack.** Alertmanager and alerting rules, node-exporter and kube-state-metrics, and Prometheus storage that outlives its pod, or remote write to long-term storage. The install here is trimmed to fit a 4 GiB node ([Monitoring](#monitoring)).
+
+## How this was built
+
+The work was done with Claude Code, Anthropic's coding agent, in a fixed loop. The plan and every ticket are in the repo, under [`.scratch/k8s-delivery/`](.scratch/k8s-delivery).
+
+1. **Grilling.** Before any code, the agent asked about one decision at a time: the git workflow, each tool, the registry, the GitOps layout, the secrets, and what to leave out. It didn't move on until each one was settled. Decisions with a lasting trade-off became the [ADRs](docs/adr), and the vocabulary became [GLOSSARY.md](GLOSSARY.md).
+2. **Spec.** The answers became [`spec.md`](.scratch/k8s-delivery/spec.md): the problem, user stories for the reviewer, the developer and the operator, the implementation and testing decisions, and what is out of scope.
+3. **Tickets.** The spec was cut into 31 tickets in [`issues/`](.scratch/k8s-delivery/issues). Each one has acceptance criteria, the tickets it waits for, and the step only a human can take, if there is one.
+4. **One branch and PR per ticket.** Each ticket was built on its own branch, named `<type>/<NN>-<slug>`, and merged through a PR that every Gate checked. The PR also set the ticket's status to `done` and recorded how each criterion was checked.
+5. **Proof against the real system.** A criterion counted as met only after it was seen working: on the minikube cluster, in a CI run or on GitHub. The "Checked on minikube" paragraphs and the [Evidence index](#evidence-index) come from those checks, with their times and numbers. Where a check failed, the README says so, as with the timeouts in the [Rollback](#rollback) request loop.
+
+The human kept the steps that need a person or a credential:
+- Creating the tokens. They were typed in without echo and never pasted into the chat.
+- Approving each change to repo settings, the ruleset and the deploy key.
+- Running `minikube tunnel` and taking the screenshots. Each screenshot was checked for private details before it entered the repo.
+- Deciding whenever a trade-off came up.
+
+The agent's own tooling (its skills and instructions) was removed from the repo in the first ticket, so the tree holds only the deliverable. The history before that commit was not rewritten.
