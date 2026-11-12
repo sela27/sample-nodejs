@@ -170,12 +170,13 @@ metadata:
 EOF
 }
 
-# The registry pull secret for the private image: the one object in the
-# cluster that does not come from git (ADR-0003). The chart's ServiceAccount
-# names it. The function body is a subshell with xtrace off, and the token
-# reaches kubectl on stdin through printf, a shell builtin, so neither
-# `bash -x` nor the process list shows it. Server-side apply keeps a re-run
-# idempotent, and a re-run with a new token replaces the old one.
+# The registry pull secret for the private image. It and Grafana's admin login
+# below are the two objects in the cluster that do not come from git
+# (ADR-0003). The chart's ServiceAccount names it. The function body is a
+# subshell with xtrace off, and the token reaches kubectl on stdin through
+# printf, a shell builtin, so neither `bash -x` nor the process list shows it.
+# Server-side apply keeps a re-run idempotent, and a re-run with a new token
+# replaces the old one.
 create_pull_secret() (
   set +x
   log "Creating the registry pull secret ${PULL_SECRET} in namespace ${APP_NAMESPACE} (token not shown)"

@@ -58,9 +58,11 @@ jobs:
   # Ingress TLS off and on and with the ServiceMonitor on, is validated against the Kubernetes schemas
   # (kubeconform, strict) and checked for what it must promise (Public paths
   # only, probes, ports, pod hardening, ServiceAccount, app configuration and
-  # its rollout checksum, labels, the TLS and ServiceMonitor flags). The
-  # ServiceMonitor is validated against its CRD schema, vendored in
-  # scripts/schemas, so the job downloads no schema.
+  # its rollout checksum, labels, the TLS and ServiceMonitor flags).
+  # kubeconform downloads the Kubernetes schemas at run time from its default
+  # source, for the Kubernetes version check-chart.sh sets, with no checksum.
+  # The ServiceMonitor's CRD schema, which that source does not have, is
+  # vendored in scripts/schemas.
   # scripts/check-chart.sh holds the checks, so a local run matches this job.
   chart:
     runs-on: ubuntu-24.04
