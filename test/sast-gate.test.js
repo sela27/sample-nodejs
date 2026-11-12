@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { isBlocking, parseProperties, run } = require('../scripts/sast-gate');
+const { run } = require('../scripts/sast-gate');
 
 const PROPERTIES = 'sonar.organization=acme\nsonar.projectKey=acme_app\n# a comment\n';
 const REPORT_TASK = 'projectKey=acme_app\nceTaskId=TASK1\n';
@@ -37,9 +37,9 @@ function fakeApi({ tasks, issues }) {
   return { fetch, requests };
 }
 
-async function gate(argv, api, env = {}) {
+async function gate(argv, api, env = {}, fileOverrides = {}) {
   const lines = [];
-  const files = { 'sonar-project.properties': PROPERTIES, '.scannerwork/report-task.txt': REPORT_TASK };
+  const files = { 'sonar-project.properties': PROPERTIES, '.scannerwork/report-task.txt': REPORT_TASK, ...fileOverrides };
   const code = await run(argv, { SONAR_TOKEN: 'tok', SONAR_HOST_URL: 'https://sonar.test', ...env }, {
     fetch: api.fetch,
     readFile: (file) => files[file],
@@ -54,17 +54,49 @@ async function gate(argv, api, env = {}) {
 const prTask = { componentKey: 'acme_app', status: 'SUCCESS', pullRequest: '7' };
 const mainTask = { componentKey: 'acme_app', status: 'SUCCESS', branch: 'main' };
 
-test('isBlocking: BLOCKER or CRITICAL in standard mode, SECURITY BLOCKER or HIGH in MQR mode', () => {
-  assert.equal(isBlocking({ severity: 'BLOCKER' }), true);
-  assert.equal(isBlocking({ severity: 'CRITICAL' }), true);
-  assert.equal(isBlocking({ severity: 'MAJOR', impacts: [{ softwareQuality: 'SECURITY', severity: 'HIGH' }] }), true);
-  assert.equal(isBlocking({ severity: 'MAJOR', impacts: [{ softwareQuality: 'SECURITY', severity: 'BLOCKER' }] }), true);
-  assert.equal(isBlocking({ severity: 'MAJOR', impacts: [{ softwareQuality: 'SECURITY', severity: 'MEDIUM' }] }), false);
-  assert.equal(isBlocking({ severity: 'MAJOR', impacts: [{ softwareQuality: 'MAINTAINABILITY', severity: 'HIGH' }] }), false);
+test('a PR blocks on BLOCKER or CRITICAL in standard mode, or a SECURITY impact of BLOCKER or HIGH in MQR mode, and on nothing else', async () => {
+  const impact = (softwareQuality, severity) => ({ severity: 'MAJOR', impacts: [{ softwareQuality, severity }] });
+  const api = fakeApi({
+    tasks: [prTask],
+    issues: {
+      7: [
+        issue('B1', { severity: 'BLOCKER' }),
+        issue('B2', { severity: 'CRITICAL' }),
+        issue('B3', impact('SECURITY', 'BLOCKER')),
+        issue('B4', impact('SECURITY', 'HIGH')),
+        issue('N1', impact('SECURITY', 'MEDIUM')),
+        issue('N2', impact('MAINTAINABILITY', 'HIGH')),
+      ],
+    },
+  });
+  const { code, output } = await gate(['--pull-request', '7'], api);
+  assert.equal(code, 1);
+  assert.match(output, /pull request 7: 6 open vulnerabilities, 4 blocking/);
+  for (const key of ['B1', 'B2', 'B3', 'B4']) assert.match(output, new RegExp(`&open=${key}$`, 'm'));
+  for (const key of ['N1', 'N2']) assert.doesNotMatch(output, new RegExp(`&open=${key}$`, 'm'));
+  assert.match(output, /BLOCKING {2}MAJOR, SECURITY:BLOCKER {2}/);
 });
 
-test('parseProperties skips comments and keeps values with =', () => {
-  assert.deepEqual(parseProperties('# c\n\na=1\nb = x=y\r\n'), { a: '1', b: 'x=y' });
+test('reads the project from sonar-project.properties and the task from the scanner file as written', async () => {
+  // Comments, blank lines, spaces around "=", CRLF line ends, and the
+  // scanner's other keys, whose values hold "=" themselves.
+  const files = {
+    'sonar-project.properties': '# SonarQube Cloud\r\n! another comment\r\n\r\nsonar.organization = acme\r\nsonar.projectKey=acme_app\r\n',
+    '.scannerwork/report-task.txt': [
+      'organization=acme',
+      'projectKey=acme_app',
+      'serverUrl=https://sonar.test',
+      'dashboardUrl=https://sonar.test/dashboard?id=acme_app&pullRequest=7',
+      'ceTaskId=TASK1',
+      'ceTaskUrl=https://sonar.test/api/ce/task?id=TASK1',
+    ].join('\r\n'),
+  };
+  const api = fakeApi({ tasks: [prTask], issues: {} });
+  const { code, output } = await gate(['--pull-request', '7'], api, {}, files);
+  assert.equal(code, 0, output);
+  assert.match(output, /^SAST Gate: acme_app \(organization acme\)$/m);
+  assert.deepEqual(api.requests.find((r) => r.path === '/api/ce/task').params, { id: 'TASK1' });
+  assert.ok(api.requests.filter((r) => r.path === '/api/issues/search').every((r) => r.params.componentKeys === 'acme_app'));
 });
 
 test('a PR fails on a blocking vulnerability it adds, after waiting for the analysis', async () => {

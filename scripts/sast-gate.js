@@ -241,7 +241,7 @@ async function run(argv, env, deps = {}) {
   }
 }
 
-module.exports = { parseProperties, isBlocking, severityLabel, run };
+module.exports = { run };
 
 if (require.main === module) {
   run(process.argv.slice(2), process.env).then(
